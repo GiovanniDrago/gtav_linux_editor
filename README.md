@@ -19,6 +19,13 @@ The app bundles its own `CwAssetTool` source in `external/CwAssetTool/`, downloa
 - Saves rebuilt assets into `builds/`.
 - Copies all built assets into a user-defined destination while preserving the fake folder structure.
 
+## Docs
+
+- `docs/PROJECT_OVERVIEW.md` - high-level project purpose, dependency model, and runtime flow
+- `docs/V1_DEVELOPMENT_NOTES.md` - main technical difficulties and v1 decisions
+- `docs/UI_ARCHITECTURE.md` - screen layout and UI behavior summary
+- `docs/AI_HANDOFF.md` - quick orientation notes for the next AI/code agent
+
 ## Runtime requirements
 
 - Rust toolchain
