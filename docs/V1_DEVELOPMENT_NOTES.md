@@ -66,6 +66,8 @@ Main cleanup points:
 - The setup/update system is practical, not deeply abstracted.
 - Theme selection uses libadwaita style management, which is the right default for GNOME, but custom theme extensibility is minimal.
 - The editor layout system is functional but remains a likely hotspot for future visual tuning.
+- `.rpf` support currently focuses on browsing archives and editing supported embedded texture-bearing assets; unsupported binaries and more complex 3D-only content still fall back to `Not supported.`
+- Archive navigation, search, and inline expansion now add more stateful behavior to the middle pane, which increases complexity inside `src/main.rs`.
 
 ## Good Next Refactors
 

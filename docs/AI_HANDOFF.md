@@ -90,9 +90,33 @@ Search for:
 Search for:
 
 - `import_asset_draft`
+- `list_rpf_tree`
+- `export_archive_entry_draft`
 - `parse_textures_from_xml`
 - `apply_texture_job`
 - `save_asset_build_job`
+- `save_rpf_build_job`
+
+### Archive browsing / state
+
+Search for:
+
+- `RpfTreeNode`
+- `ImportedArchiveEntry`
+- `refresh_textures_list`
+- `append_archive_rows`
+- `select_archive_parent`
+- `set_archive_search_query`
+
+### Helper-side archive commands
+
+Search for:
+
+- `list-rpf`
+- `export-rpf-entry`
+- `build-rpf`
+- `CreateRpfManager`
+- `GetRpfEntryExportData`
 
 ## Things That Were Already Decided
 

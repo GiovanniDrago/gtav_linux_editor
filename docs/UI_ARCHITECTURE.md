@@ -40,10 +40,16 @@ The browser screen is a 3-pane layout.
 - import files into current folder
 - move selected imported package into current folder
 
-### Middle pane: textures
+### Middle pane: textures / archive explorer
 
-- texture list for the selected package
-- name, dimensions, format, mip count
+- standalone `.ydr`, `.yft`, and `.ytd` imports still show the texture list directly
+- `.rpf` imports first show an archive explorer rooted at the imported archive
+- the archive explorer includes a current-section search bar, path label, and `Up` button
+- folders and package files can be entered by clicking the row label
+- folders and package files can also be expanded inline with `+/-` without changing the current section
+- opening a supported embedded `.ydr`, `.yft`, or `.ytd` switches the pane to the texture list for that file
+- unsupported embedded files currently show `Not supported.`
+- texture rows show name, dimensions, format, and mip count
 
 ### Right pane: preview
 
@@ -120,5 +126,7 @@ Useful places in `src/main.rs`:
 - `build_widgets` - UI construction
 - `connect_signals` - signal wiring
 - `handle_job_results` - async result handling
+- `refresh_textures_list` - archive explorer and texture-list mode switching
+- `append_archive_rows` - middle-pane archive tree/list rendering
 - `build_section_widget` - recursive editor rendering
 - `add_section_controls` - per-section controls
