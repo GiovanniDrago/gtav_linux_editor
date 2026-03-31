@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -282,6 +283,8 @@ impl SetupStatus {
 enum AssetKind {
     Ydr,
     Yft,
+    Ytd,
+    Rpf,
 }
 
 impl AssetKind {
@@ -294,6 +297,8 @@ impl AssetKind {
         {
             "ydr" => Some(Self::Ydr),
             "yft" => Some(Self::Yft),
+            "ytd" => Some(Self::Ytd),
+            "rpf" => Some(Self::Rpf),
             _ => None,
         }
     }
@@ -302,6 +307,8 @@ impl AssetKind {
         match self {
             Self::Ydr => "YDR",
             Self::Yft => "YFT",
+            Self::Ytd => "YTD",
+            Self::Rpf => "RPF",
         }
     }
 }
@@ -380,8 +387,16 @@ struct ImportedAsset {
     source_path: PathBuf,
     kind: AssetKind,
     folder_id: u64,
-    xml_path: PathBuf,
+    xml_path: Option<PathBuf>,
     textures: Vec<TextureEntry>,
+    archive_tree: Option<RpfTreeNode>,
+    archive_entries: Vec<ImportedArchiveEntry>,
+    archive_current_path: Option<String>,
+    archive_expanded_paths: HashSet<String>,
+    archive_selected_file: Option<String>,
+    archive_file_notice: Option<String>,
+    archive_file_loading_path: Option<String>,
+    archive_search_query: String,
     dirty: bool,
     last_saved_path: Option<PathBuf>,
 }
@@ -392,6 +407,45 @@ impl ImportedAsset {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.source_path.display().to_string())
+    }
+
+    fn is_archive(&self) -> bool {
+        self.kind == AssetKind::Rpf
+    }
+
+    fn archive_root_path(&self) -> Option<&str> {
+        self.archive_tree.as_ref().map(|tree| tree.path.as_str())
+    }
+
+    fn archive_current_display_path(&self) -> Option<String> {
+        let path = self
+            .archive_selected_file
+            .as_deref()
+            .or(self.archive_current_path.as_deref())?;
+        self.find_archive_node(path)
+            .map(|node| node.display_path.clone())
+    }
+
+    fn find_archive_node(&self, path: &str) -> Option<&RpfTreeNode> {
+        self.archive_tree.as_ref()?.find(path)
+    }
+
+    fn find_archive_entry(&self, entry_path: &str) -> Option<&ImportedArchiveEntry> {
+        self.archive_entries
+            .iter()
+            .find(|entry| entry.entry_path == entry_path)
+    }
+
+    fn find_archive_entry_mut(&mut self, entry_path: &str) -> Option<&mut ImportedArchiveEntry> {
+        self.archive_entries
+            .iter_mut()
+            .find(|entry| entry.entry_path == entry_path)
+    }
+
+    fn sync_archive_dirty(&mut self) {
+        if self.is_archive() {
+            self.dirty = self.archive_entries.iter().any(|entry| entry.dirty);
+        }
     }
 }
 
@@ -413,8 +467,72 @@ struct ImportedAssetDraft {
     source_path: PathBuf,
     kind: AssetKind,
     folder_id: u64,
+    xml_path: Option<PathBuf>,
+    textures: Vec<TextureEntryDraft>,
+    archive_tree: Option<RpfTreeNode>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpfTreeNode {
+    name: String,
+    path: String,
+    display_path: String,
+    kind: RpfTreeNodeKind,
+    supported_asset: bool,
+    children: Vec<RpfTreeNode>,
+}
+
+impl RpfTreeNode {
+    fn find(&self, path: &str) -> Option<&Self> {
+        if self.path == path {
+            return Some(self);
+        }
+
+        self.children.iter().find_map(|child| child.find(path))
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RpfTreeNodeKind {
+    Folder,
+    Package,
+    File,
+}
+
+struct ImportedArchiveEntry {
+    entry_path: String,
+    title: String,
+    xml_path: PathBuf,
+    textures: Vec<TextureEntry>,
+    dirty: bool,
+}
+
+#[derive(Clone)]
+struct ImportedArchiveEntryDraft {
+    entry_path: String,
+    title: String,
     xml_path: PathBuf,
     textures: Vec<TextureEntryDraft>,
+}
+
+enum ArchiveEntryOpenOutcome {
+    Supported(ImportedArchiveEntryDraft),
+    Unsupported(String),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RpfBuildManifest {
+    changes: Vec<RpfBuildChange>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RpfBuildChange {
+    entry_path: String,
+    xml_path: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -631,15 +749,17 @@ impl SectionNode {
 
 struct EditorState {
     asset_index: usize,
+    entry_path: Option<String>,
     texture_index: usize,
     root: SectionNode,
     next_section_id: u64,
 }
 
 impl EditorState {
-    fn new(asset_index: usize, texture_index: usize) -> Self {
+    fn new(asset_index: usize, entry_path: Option<String>, texture_index: usize) -> Self {
         Self {
             asset_index,
+            entry_path,
             texture_index,
             root: SectionNode::empty_leaf(1),
             next_section_id: 2,
@@ -700,11 +820,17 @@ struct PixelRect {
 
 enum JobResult {
     ImportFinished(std::result::Result<ImportedAssetDraft, String>),
+    OpenArchiveEntryFinished {
+        asset_id: String,
+        entry_path: String,
+        result: std::result::Result<ArchiveEntryOpenOutcome, String>,
+    },
     DownloadCodeWalkerFinished(std::result::Result<(), String>),
     BuildHelperFinished(std::result::Result<(), String>),
     UpdateCodeWalkerFinished(std::result::Result<String, String>),
     PreviewFinished {
         asset_id: String,
+        entry_path: Option<String>,
         texture_index: usize,
         result: std::result::Result<PathBuf, String>,
     },
@@ -714,6 +840,7 @@ enum JobResult {
     },
     ApplyFinished {
         asset_id: String,
+        entry_path: Option<String>,
         texture_index: usize,
         result: std::result::Result<(), String>,
     },
@@ -741,6 +868,10 @@ struct AppWidgets {
     move_here_button: gtk::Button,
     package_list_box: gtk::Box,
     textures_title_label: gtk::Label,
+    textures_search_entry: gtk::SearchEntry,
+    textures_path_label: gtk::Label,
+    textures_back_button: gtk::Button,
+    textures_notice_label: gtk::Label,
     texture_list_box: gtk::Box,
     preview_asset_label: gtk::Label,
     preview_texture_label: gtk::Label,
@@ -816,7 +947,7 @@ impl App {
             last_image_dir: None,
             last_copy_dir: None,
             pending_jobs: 0,
-            status: "Ready. Import one or more .ydr or .yft files to begin.".to_owned(),
+            status: "Ready. Import .ydr, .yft, .ytd, or .rpf files to begin.".to_owned(),
             job_tx,
             job_rx,
             widgets,
@@ -904,23 +1035,24 @@ impl App {
             !in_editor
                 && !setup_required
                 && self
-                    .selected_asset
-                    .and_then(|asset_index| self.assets.get(asset_index))
-                    .and_then(|asset| {
-                        self.selected_texture
-                            .and_then(|texture_index| asset.textures.get(texture_index))
-                    })
+                    .current_texture_entry()
                     .is_some_and(|texture| texture.format.supported_for_write()),
         );
         self.widgets.editor_apply_button.set_sensitive(
             !setup_required
                 && self.editor.as_ref().is_some_and(|editor| {
-                    self.assets
-                        .get(editor.asset_index)
-                        .and_then(|asset| asset.textures.get(editor.texture_index))
-                        .is_some_and(|texture| {
-                            texture.format.supported_for_write() && editor.is_complete()
-                        })
+                    let texture = self.assets.get(editor.asset_index).and_then(|asset| {
+                        if let Some(entry_path) = editor.entry_path.as_deref() {
+                            asset
+                                .find_archive_entry(entry_path)
+                                .and_then(|entry| entry.textures.get(editor.texture_index))
+                        } else {
+                            asset.textures.get(editor.texture_index)
+                        }
+                    });
+                    texture.is_some_and(|texture| {
+                        texture.format.supported_for_write() && editor.is_complete()
+                    })
                 }),
         );
 
@@ -1149,13 +1281,263 @@ impl App {
         indices
     }
 
+    fn active_archive_entry_path(&self, asset_index: usize) -> Option<String> {
+        let asset = self.assets.get(asset_index)?;
+        if !asset.is_archive() {
+            return None;
+        }
+        let entry_path = asset.archive_selected_file.as_ref()?;
+        asset.find_archive_entry(entry_path)?;
+        Some(entry_path.clone())
+    }
+
+    fn current_texture_entry(&self) -> Option<&TextureEntry> {
+        let asset_index = self.selected_asset?;
+        let texture_index = self.selected_texture?;
+        let asset = self.assets.get(asset_index)?;
+
+        if let Some(entry_path) = self.active_archive_entry_path(asset_index) {
+            asset
+                .find_archive_entry(&entry_path)?
+                .textures
+                .get(texture_index)
+        } else {
+            asset.textures.get(texture_index)
+        }
+    }
+
+    fn current_texture_entry_mut(&mut self) -> Option<&mut TextureEntry> {
+        let asset_index = self.selected_asset?;
+        let texture_index = self.selected_texture?;
+        let entry_path = self.active_archive_entry_path(asset_index);
+        let asset = self.assets.get_mut(asset_index)?;
+
+        if let Some(entry_path) = entry_path {
+            asset
+                .find_archive_entry_mut(&entry_path)?
+                .textures
+                .get_mut(texture_index)
+        } else {
+            asset.textures.get_mut(texture_index)
+        }
+    }
+
+    fn current_archive_entry(&self) -> Option<&ImportedArchiveEntry> {
+        let asset_index = self.selected_asset?;
+        let entry_path = self.active_archive_entry_path(asset_index)?;
+        self.assets
+            .get(asset_index)?
+            .find_archive_entry(&entry_path)
+    }
+
+    fn archive_current_node<'a>(&self, asset: &'a ImportedAsset) -> Option<&'a RpfTreeNode> {
+        let current_path = asset
+            .archive_current_path
+            .as_deref()
+            .or(asset.archive_root_path())?;
+        asset.find_archive_node(current_path)
+    }
+
+    fn archive_parent_path_for(&self, asset: &ImportedAsset, path: &str) -> Option<String> {
+        let root_path = asset.archive_root_path()?;
+        if path == root_path {
+            return None;
+        }
+
+        let mut parent_path = None;
+        if let Some(tree) = &asset.archive_tree {
+            find_archive_parent_path(tree, path, &mut parent_path);
+        }
+        parent_path
+    }
+
+    fn archive_parent_path(&self, asset: &ImportedAsset) -> Option<String> {
+        let current_path = asset.archive_current_path.as_deref()?;
+        self.archive_parent_path_for(asset, current_path)
+    }
+
+    fn browse_archive_path(&mut self, asset_index: usize, path: String) {
+        let Some(asset) = self.assets.get_mut(asset_index) else {
+            return;
+        };
+        asset.archive_current_path = Some(path);
+        asset.archive_selected_file = None;
+        asset.archive_file_notice = None;
+        asset.archive_file_loading_path = None;
+        self.selected_texture = None;
+        self.refresh_all();
+    }
+
+    fn toggle_archive_path_expanded(&mut self, asset_index: usize, path: &str) {
+        let Some(asset) = self.assets.get_mut(asset_index) else {
+            return;
+        };
+
+        if asset.archive_expanded_paths.contains(path) {
+            asset.archive_expanded_paths.remove(path);
+        } else {
+            asset.archive_expanded_paths.insert(path.to_owned());
+        }
+
+        self.refresh_textures_list();
+    }
+
+    fn set_archive_search_query(&mut self, query: String) {
+        let Some(asset_index) = self.selected_asset else {
+            return;
+        };
+        let Some(asset) = self.assets.get_mut(asset_index) else {
+            return;
+        };
+        if !asset.is_archive() {
+            return;
+        }
+        if asset.archive_search_query == query {
+            return;
+        }
+
+        asset.archive_search_query = query;
+        self.refresh_textures_list();
+    }
+
+    fn select_archive_parent(&mut self) {
+        let Some(asset_index) = self.selected_asset else {
+            return;
+        };
+        if let Some(asset) = self.assets.get_mut(asset_index) {
+            if asset.archive_selected_file.is_some() {
+                asset.archive_selected_file = None;
+                asset.archive_file_notice = None;
+                asset.archive_file_loading_path = None;
+                self.selected_texture = None;
+                self.refresh_all();
+                return;
+            }
+        }
+        let Some(parent_path) = self
+            .assets
+            .get(asset_index)
+            .and_then(|asset| self.archive_parent_path(asset))
+        else {
+            return;
+        };
+        self.browse_archive_path(asset_index, parent_path);
+    }
+
+    fn open_archive_file(&mut self, asset_index: usize, entry_path: String) {
+        let Some(node) = self
+            .assets
+            .get(asset_index)
+            .and_then(|asset| asset.find_archive_node(&entry_path))
+            .cloned()
+        else {
+            self.set_status("Archive entry could not be found.");
+            return;
+        };
+        let parent_path = self
+            .assets
+            .get(asset_index)
+            .and_then(|asset| self.archive_parent_path_for(asset, &entry_path));
+        let Some(asset) = self.assets.get_mut(asset_index) else {
+            return;
+        };
+
+        asset.archive_selected_file = Some(entry_path.clone());
+        if let Some(parent_path) = parent_path {
+            asset.archive_current_path = Some(parent_path);
+        }
+        asset.archive_file_notice = None;
+        self.selected_texture = None;
+
+        if !node.supported_asset {
+            asset.archive_file_loading_path = None;
+            asset.archive_file_notice = Some("Not supported.".to_owned());
+            let _ = asset;
+            self.refresh_all();
+            return;
+        }
+
+        if let Some(existing_textures_len) = asset
+            .find_archive_entry(&entry_path)
+            .map(|entry| entry.textures.len())
+        {
+            asset.archive_file_loading_path = None;
+            asset.archive_file_notice = if existing_textures_len == 0 {
+                Some("Not supported.".to_owned())
+            } else {
+                None
+            };
+            self.selected_texture = if existing_textures_len == 0 {
+                None
+            } else {
+                Some(0)
+            };
+            let _ = asset;
+            self.request_preview_for_selected_texture();
+            self.refresh_all();
+            return;
+        }
+
+        let asset_id = asset.id.clone();
+        let archive_path = asset.source_path.clone();
+        let file_title = node.name.clone();
+        let Some(_) = AssetKind::from_path(Path::new(&file_title)) else {
+            asset.archive_file_loading_path = None;
+            asset.archive_file_notice = Some("Not supported.".to_owned());
+            let _ = asset;
+            self.refresh_all();
+            return;
+        };
+        asset.archive_file_loading_path = Some(entry_path.clone());
+        let tool_paths = self.tool_paths.clone();
+        let tx = self.job_tx.clone();
+
+        self.pending_jobs += 1;
+        self.set_status(format!("Opening {}...", file_title));
+
+        thread::spawn(move || {
+            let result = export_archive_entry_draft(&tool_paths, &archive_path, &entry_path)
+                .map(ArchiveEntryOpenOutcome::Supported)
+                .or_else(|error| {
+                    if error.to_string().contains("No DDS textures were found") {
+                        Ok(ArchiveEntryOpenOutcome::Unsupported(
+                            "Not supported.".to_owned(),
+                        ))
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| format!("{}", error));
+
+            let _ = tx.send(JobResult::OpenArchiveEntryFinished {
+                asset_id,
+                entry_path,
+                result,
+            });
+        });
+
+        self.refresh_all();
+    }
+
     fn select_asset(&mut self, asset_index: usize) {
         self.selected_asset = Some(asset_index);
-        self.selected_texture = if self.assets[asset_index].textures.is_empty() {
-            None
+        if self.assets[asset_index].is_archive() {
+            if self.assets[asset_index].archive_current_path.is_none() {
+                self.assets[asset_index].archive_current_path = self.assets[asset_index]
+                    .archive_root_path()
+                    .map(ToOwned::to_owned);
+            }
+            self.assets[asset_index].archive_selected_file = None;
+            self.assets[asset_index].archive_file_notice = None;
+            self.assets[asset_index].archive_file_loading_path = None;
+            self.selected_texture = None;
         } else {
-            Some(0)
-        };
+            self.selected_texture = if self.assets[asset_index].textures.is_empty() {
+                None
+            } else {
+                Some(0)
+            };
+        }
         self.request_preview_for_selected_texture();
         self.refresh_all();
     }
@@ -1174,11 +1556,15 @@ impl App {
             return;
         };
 
-        let (asset_id, dds_path, preview_png_path) = {
-            let Some(asset) = self.assets.get_mut(asset_index) else {
-                return;
-            };
-            let Some(texture) = asset.textures.get_mut(texture_index) else {
+        let entry_path = self.active_archive_entry_path(asset_index);
+
+        let asset_id = match self.assets.get(asset_index) {
+            Some(asset) => asset.id.clone(),
+            None => return,
+        };
+
+        let (dds_path, preview_png_path) = {
+            let Some(texture) = self.current_texture_entry_mut() else {
                 return;
             };
 
@@ -1187,11 +1573,7 @@ impl App {
             }
 
             texture.preview_loading = true;
-            (
-                asset.id.clone(),
-                texture.dds_path.clone(),
-                texture.preview_png_path.clone(),
-            )
+            (texture.dds_path.clone(), texture.preview_png_path.clone())
         };
 
         self.pending_jobs += 1;
@@ -1209,6 +1591,7 @@ impl App {
 
             let _ = tx.send(JobResult::PreviewFinished {
                 asset_id,
+                entry_path,
                 texture_index,
                 result,
             });
@@ -1246,6 +1629,14 @@ impl App {
                                     modified: false,
                                 })
                                 .collect(),
+                            archive_tree: draft.archive_tree,
+                            archive_entries: Vec::new(),
+                            archive_current_path: None,
+                            archive_expanded_paths: HashSet::new(),
+                            archive_selected_file: None,
+                            archive_file_notice: None,
+                            archive_file_loading_path: None,
+                            archive_search_query: String::new(),
                             dirty: false,
                             last_saved_path: None,
                         };
@@ -1259,6 +1650,69 @@ impl App {
                         self.set_status(format!("Import failed: {error}"));
                     }
                 },
+                JobResult::OpenArchiveEntryFinished {
+                    asset_id,
+                    entry_path,
+                    result,
+                } => {
+                    if let Some(asset) = self.assets.iter_mut().find(|asset| asset.id == asset_id) {
+                        asset.archive_file_loading_path = None;
+                        match result {
+                            Ok(ArchiveEntryOpenOutcome::Supported(draft)) => {
+                                let opened_title = draft.title.clone();
+                                let imported_entry = ImportedArchiveEntry {
+                                    entry_path: draft.entry_path.clone(),
+                                    title: draft.title,
+                                    xml_path: draft.xml_path,
+                                    textures: draft
+                                        .textures
+                                        .into_iter()
+                                        .map(|texture| TextureEntry {
+                                            name: texture.name,
+                                            file_name: texture.file_name,
+                                            width: texture.width,
+                                            height: texture.height,
+                                            mips: texture.mips,
+                                            format: texture.format,
+                                            usage: texture.usage,
+                                            dds_path: texture.dds_path,
+                                            preview_png_path: texture.preview_png_path,
+                                            preview_texture: None,
+                                            preview_loading: false,
+                                            modified: false,
+                                        })
+                                        .collect(),
+                                    dirty: false,
+                                };
+
+                                if let Some(existing) =
+                                    asset.find_archive_entry_mut(&draft.entry_path)
+                                {
+                                    *existing = imported_entry;
+                                } else {
+                                    asset.archive_entries.push(imported_entry);
+                                }
+
+                                asset.archive_selected_file = Some(entry_path.clone());
+                                asset.archive_file_notice = None;
+                                self.selected_texture = Some(0);
+                                self.request_preview_for_selected_texture();
+                                self.set_status(format!("Opened {}", opened_title));
+                            }
+                            Ok(ArchiveEntryOpenOutcome::Unsupported(message)) => {
+                                asset.archive_selected_file = Some(entry_path);
+                                asset.archive_file_notice = Some(message.clone());
+                                self.selected_texture = None;
+                                self.set_status(message);
+                            }
+                            Err(error) => {
+                                asset.archive_file_notice = Some("Not supported.".to_owned());
+                                self.selected_texture = None;
+                                self.set_status(format!("Open failed: {error}"));
+                            }
+                        }
+                    }
+                }
                 JobResult::DownloadCodeWalkerFinished(result) => match result {
                     Ok(()) => {
                         self.setup_status = SetupStatus::detect(&self.tool_paths);
@@ -1294,12 +1748,20 @@ impl App {
                 },
                 JobResult::PreviewFinished {
                     asset_id,
+                    entry_path,
                     texture_index,
                     result,
                 } => {
                     let mut status_message = None;
                     if let Some(asset) = self.assets.iter_mut().find(|asset| asset.id == asset_id) {
-                        if let Some(texture) = asset.textures.get_mut(texture_index) {
+                        let texture = if let Some(entry_path) = entry_path.as_deref() {
+                            asset
+                                .find_archive_entry_mut(entry_path)
+                                .and_then(|entry| entry.textures.get_mut(texture_index))
+                        } else {
+                            asset.textures.get_mut(texture_index)
+                        };
+                        if let Some(texture) = texture {
                             texture.preview_loading = false;
                             match result {
                                 Ok(path) => match texture_from_path(&path) {
@@ -1336,6 +1798,12 @@ impl App {
                                 for texture in &mut asset.textures {
                                     texture.modified = false;
                                 }
+                                for entry in &mut asset.archive_entries {
+                                    entry.dirty = false;
+                                    for texture in &mut entry.textures {
+                                        texture.modified = false;
+                                    }
+                                }
                                 self.set_status(format!("Saved build to {}", path.display()));
                             }
                             Err(error) => {
@@ -1350,6 +1818,7 @@ impl App {
                 }
                 JobResult::ApplyFinished {
                     asset_id,
+                    entry_path,
                     texture_index,
                     result,
                 } => {
@@ -1358,9 +1827,14 @@ impl App {
                     if let Some(asset_index) =
                         self.assets.iter().position(|asset| asset.id == asset_id)
                     {
-                        if let Some(texture) =
+                        let texture = if let Some(entry_path) = entry_path.as_deref() {
+                            self.assets[asset_index]
+                                .find_archive_entry_mut(entry_path)
+                                .and_then(|entry| entry.textures.get_mut(texture_index))
+                        } else {
                             self.assets[asset_index].textures.get_mut(texture_index)
-                        {
+                        };
+                        if let Some(texture) = texture {
                             match result {
                                 Ok(()) => {
                                     let texture_name = texture.name.clone();
@@ -1378,7 +1852,16 @@ impl App {
                         }
 
                         if apply_success {
-                            self.assets[asset_index].dirty = true;
+                            if let Some(entry_path) = entry_path.as_deref() {
+                                if let Some(entry) =
+                                    self.assets[asset_index].find_archive_entry_mut(entry_path)
+                                {
+                                    entry.dirty = true;
+                                }
+                                self.assets[asset_index].sync_archive_dirty();
+                            } else {
+                                self.assets[asset_index].dirty = true;
+                            }
                             self.editor = None;
                             self.selected_asset = Some(asset_index);
                             self.selected_texture = Some(texture_index);
@@ -1414,67 +1897,138 @@ impl App {
 
     fn refresh_textures_list(&self) {
         clear_box(&self.widgets.texture_list_box);
+        self.widgets.textures_notice_label.set_text("");
+        self.widgets.textures_path_label.set_text("");
 
         let Some(asset_index) = self.selected_asset else {
+            self.widgets.textures_search_entry.set_visible(false);
+            self.widgets.textures_back_button.set_visible(false);
             self.widgets
                 .textures_title_label
                 .set_text("Select a package from the left pane.");
+            self.widgets.textures_path_label.set_text("");
             return;
         };
 
         let Some(asset) = self.assets.get(asset_index) else {
+            self.widgets.textures_search_entry.set_visible(false);
+            self.widgets.textures_back_button.set_visible(false);
             self.widgets
                 .textures_title_label
                 .set_text("Select a package from the left pane.");
+            self.widgets.textures_path_label.set_text("");
             return;
         };
 
+        if asset.is_archive() {
+            self.widgets.textures_search_entry.set_visible(true);
+            if self.widgets.textures_search_entry.text().as_str() != asset.archive_search_query {
+                self.widgets
+                    .textures_search_entry
+                    .set_text(&asset.archive_search_query);
+            }
+            self.widgets
+                .textures_title_label
+                .set_text("Archive Explorer");
+            self.widgets.textures_path_label.set_text(
+                &asset
+                    .archive_current_display_path()
+                    .unwrap_or_else(|| asset.title()),
+            );
+            self.widgets.textures_back_button.set_visible(
+                asset.archive_selected_file.is_some() || self.archive_parent_path(asset).is_some(),
+            );
+
+            if let Some(entry_path) = asset.archive_selected_file.as_deref() {
+                self.widgets.textures_search_entry.set_visible(false);
+                let node = asset.find_archive_node(entry_path);
+                self.widgets.textures_path_label.set_text(
+                    &node
+                        .map(|node| node.display_path.clone())
+                        .unwrap_or_else(|| asset.title()),
+                );
+
+                if let Some(loading_path) = asset.archive_file_loading_path.as_deref() {
+                    if loading_path == entry_path {
+                        self.widgets
+                            .textures_notice_label
+                            .set_text("Loading file...");
+                        return;
+                    }
+                }
+
+                if let Some(entry) = asset.find_archive_entry(entry_path) {
+                    self.widgets.textures_title_label.set_text(&format!(
+                        "{} ({} textures)",
+                        entry.title,
+                        entry.textures.len()
+                    ));
+                    if entry.textures.is_empty() {
+                        self.widgets
+                            .textures_notice_label
+                            .set_text("Not supported.");
+                    } else {
+                        append_texture_rows(
+                            &self.widgets.texture_list_box,
+                            &entry.textures,
+                            self.selected_texture,
+                        );
+                    }
+                    return;
+                }
+
+                self.widgets.textures_notice_label.set_text(
+                    asset
+                        .archive_file_notice
+                        .as_deref()
+                        .unwrap_or("Not supported."),
+                );
+                return;
+            }
+
+            if let Some(node) = self.archive_current_node(asset) {
+                let trimmed_query = asset.archive_search_query.trim();
+                let filter_query =
+                    (!trimmed_query.is_empty()).then(|| trimmed_query.to_ascii_lowercase());
+
+                if node.children.is_empty() {
+                    self.widgets
+                        .textures_notice_label
+                        .set_text("This folder is empty.");
+                    return;
+                }
+
+                let rendered_rows = append_archive_rows(
+                    &self.widgets.texture_list_box,
+                    asset_index,
+                    node,
+                    &asset.archive_expanded_paths,
+                    filter_query.as_deref(),
+                    0,
+                );
+                if rendered_rows == 0 {
+                    self.widgets.textures_notice_label.set_text(&format!(
+                        "No items match \"{}\" in this section.",
+                        trimmed_query
+                    ));
+                }
+            }
+            return;
+        }
+
+        self.widgets.textures_search_entry.set_visible(false);
+        self.widgets.textures_back_button.set_visible(false);
         self.widgets.textures_title_label.set_text(&format!(
             "{} ({} textures)",
             asset.title(),
             asset.textures.len()
         ));
-
-        for (index, texture) in asset.textures.iter().enumerate() {
-            let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            row.add_css_class("boxed-list-row");
-            row.set_margin_top(4);
-            row.set_margin_bottom(4);
-            row.set_margin_start(4);
-            row.set_margin_end(4);
-
-            let button = gtk::Button::with_label(&format!(
-                "{} ({})",
-                texture.name,
-                texture.width_height_label()
-            ));
-            button.set_halign(gtk::Align::Fill);
-            button.set_hexpand(true);
-            if self.selected_texture == Some(index) {
-                button.add_css_class("suggested-action");
-            }
-            button.connect_clicked(move |_| {
-                with_app(|app| {
-                    app.select_texture(index);
-                });
-            });
-
-            let details = gtk::Label::new(Some(&format!(
-                "{} | {} | {} mips",
-                texture.file_name,
-                texture.format.label(),
-                texture.mips
-            )));
-            details.set_wrap(true);
-            details.set_xalign(0.0);
-            if texture.modified {
-                details.add_css_class("accent");
-            }
-
-            row.append(&button);
-            row.append(&details);
-            self.widgets.texture_list_box.append(&row);
-        }
+        self.widgets.textures_path_label.set_text(&asset.title());
+        append_texture_rows(
+            &self.widgets.texture_list_box,
+            &asset.textures,
+            self.selected_texture,
+        );
     }
 
     fn refresh_preview_pane(&self) {
@@ -1490,7 +2044,9 @@ impl App {
                 .set_paintable(Option::<&gdk::Paintable>::None);
             return;
         };
-        let Some(texture_index) = self.selected_texture else {
+        let asset = &self.assets[asset_index];
+
+        if !asset.is_archive() && self.selected_texture.is_none() {
             self.widgets
                 .preview_asset_label
                 .set_text("Select a texture to preview.");
@@ -1501,12 +2057,61 @@ impl App {
                 .preview_picture
                 .set_paintable(Option::<&gdk::Paintable>::None);
             return;
+        }
+
+        if asset.is_archive() && asset.archive_selected_file.is_none() {
+            self.widgets.preview_asset_label.set_text(&asset.title());
+            self.widgets
+                .preview_texture_label
+                .set_text("Archive browser");
+            self.widgets
+                .preview_meta_label
+                .set_text("Select a file in the middle pane to inspect its textures.");
+            self.widgets.preview_notice_label.set_text("");
+            self.widgets
+                .preview_picture
+                .set_paintable(Option::<&gdk::Paintable>::None);
+            return;
+        }
+
+        let Some(texture) = self.current_texture_entry() else {
+            self.widgets.preview_asset_label.set_text(&asset.title());
+            self.widgets.preview_texture_label.set_text(
+                asset
+                    .archive_selected_file
+                    .as_deref()
+                    .and_then(|entry_path| {
+                        asset
+                            .find_archive_node(entry_path)
+                            .map(|node| node.name.as_str())
+                    })
+                    .unwrap_or("Select a texture to preview."),
+            );
+            self.widgets.preview_meta_label.set_text("");
+            self.widgets.preview_notice_label.set_text(
+                asset
+                    .archive_file_notice
+                    .as_deref()
+                    .unwrap_or("Not supported."),
+            );
+            self.widgets
+                .preview_picture
+                .set_paintable(Option::<&gdk::Paintable>::None);
+            return;
         };
 
-        let asset = &self.assets[asset_index];
-        let texture = &asset.textures[texture_index];
+        let entry_title = self
+            .current_archive_entry()
+            .map(|entry| entry.title.clone());
 
         self.widgets.preview_asset_label.set_text(&asset.title());
+        if let Some(entry_title) = entry_title {
+            self.widgets.preview_asset_label.set_text(&format!(
+                "{} / {}",
+                asset.title(),
+                entry_title
+            ));
+        }
         self.widgets.preview_texture_label.set_text(&texture.name);
         self.widgets.preview_meta_label.set_text(&format!(
             "{}x{} | {} | {} mips | {}",
@@ -1546,7 +2151,8 @@ impl App {
             self.set_status("Select a texture first.");
             return;
         };
-        let Some(texture) = self.assets[asset_index].textures.get(texture_index) else {
+        let entry_path = self.active_archive_entry_path(asset_index);
+        let Some(texture) = self.current_texture_entry() else {
             return;
         };
 
@@ -1558,7 +2164,7 @@ impl App {
             return;
         }
 
-        self.editor = Some(EditorState::new(asset_index, texture_index));
+        self.editor = Some(EditorState::new(asset_index, entry_path, texture_index));
         self.widgets.stack.set_visible_child_name("editor");
         self.refresh_all();
     }
@@ -1581,13 +2187,35 @@ impl App {
         };
 
         let asset = &self.assets[editor.asset_index];
-        let texture = &asset.textures[editor.texture_index];
+        let texture = if let Some(entry_path) = editor.entry_path.as_deref() {
+            let Some(entry) = asset.find_archive_entry(entry_path) else {
+                self.widgets.stack.set_visible_child_name("browser");
+                return;
+            };
+            let Some(texture) = entry.textures.get(editor.texture_index) else {
+                self.widgets.stack.set_visible_child_name("browser");
+                return;
+            };
+            self.widgets.editor_title_label.set_text(&format!(
+                "Editing {} / {} / {}",
+                asset.title(),
+                entry.title,
+                texture.name
+            ));
+            texture
+        } else {
+            let Some(texture) = asset.textures.get(editor.texture_index) else {
+                self.widgets.stack.set_visible_child_name("browser");
+                return;
+            };
+            self.widgets.editor_title_label.set_text(&format!(
+                "Editing {} / {}",
+                asset.title(),
+                texture.name
+            ));
+            texture
+        };
         self.widgets.stack.set_visible_child_name("editor");
-        self.widgets.editor_title_label.set_text(&format!(
-            "Editing {} / {}",
-            asset.title(),
-            texture.name
-        ));
         self.widgets.editor_meta_label.set_text(&format!(
             "Target: {}x{} | {} | {} mips",
             texture.width,
@@ -1699,7 +2327,6 @@ impl App {
         };
 
         let asset_id = asset.id.clone();
-        let xml_path = asset.xml_path.clone();
         let output_path = self
             .tool_paths
             .builds_dir
@@ -1707,13 +2334,28 @@ impl App {
             .join(asset.source_path.file_name().unwrap_or_default());
         let tx = self.job_tx.clone();
         let tool_paths = self.tool_paths.clone();
+        let source_path = asset.source_path.clone();
+        let xml_path = asset.xml_path.clone();
+        let archive_changes: Vec<_> = asset
+            .archive_entries
+            .iter()
+            .filter(|entry| entry.dirty)
+            .map(|entry| RpfBuildChange {
+                entry_path: entry.entry_path.clone(),
+                xml_path: entry.xml_path.clone(),
+            })
+            .collect();
 
         self.pending_jobs += 1;
         self.set_status(format!("Saving build for {}...", asset.title()));
 
         thread::spawn(move || {
-            let result = save_asset_build_job(&tool_paths, &xml_path, &output_path)
-                .map_err(|error| format!("{}", error));
+            let result = if let Some(xml_path) = xml_path {
+                save_asset_build_job(&tool_paths, &xml_path, &output_path)
+            } else {
+                save_rpf_build_job(&tool_paths, &source_path, &output_path, archive_changes)
+            }
+            .map_err(|error| format!("{}", error));
             let _ = tx.send(JobResult::SaveFinished { asset_id, result });
         });
     }
@@ -1723,7 +2365,21 @@ impl App {
             return;
         };
         let asset = &self.assets[editor.asset_index];
-        let texture = &asset.textures[editor.texture_index];
+        let texture = if let Some(entry_path) = editor.entry_path.as_deref() {
+            let Some(entry) = asset.find_archive_entry(entry_path) else {
+                self.set_status("The selected archive entry is no longer available.");
+                return;
+            };
+            let Some(texture) = entry.textures.get(editor.texture_index) else {
+                return;
+            };
+            texture
+        } else {
+            let Some(texture) = asset.textures.get(editor.texture_index) else {
+                return;
+            };
+            texture
+        };
 
         if !texture.format.supported_for_write() {
             self.set_status(format!(
@@ -1751,6 +2407,7 @@ impl App {
         };
 
         let asset_id = asset.id.clone();
+        let entry_path = editor.entry_path.clone();
         let texture_index = editor.texture_index;
         let dds_path = texture.dds_path.clone();
         let preview_png_path = texture.preview_png_path.clone();
@@ -1777,6 +2434,7 @@ impl App {
 
             let _ = tx.send(JobResult::ApplyFinished {
                 asset_id,
+                entry_path,
                 texture_index,
                 result,
             });
@@ -2029,6 +2687,21 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::clone(app);
+        widgets.textures_back_button.connect_clicked(move |_| {
+            app.borrow_mut().select_archive_parent();
+        });
+    }
+    {
+        let app = Rc::clone(app);
+        widgets
+            .textures_search_entry
+            .connect_search_changed(move |entry| {
+                app.borrow_mut()
+                    .set_archive_search_query(entry.text().to_string());
+            });
+    }
+    {
+        let app = Rc::clone(app);
         widgets.back_button.connect_clicked(move |_| {
             let mut app = app.borrow_mut();
             if app.editor.is_some() {
@@ -2267,6 +2940,22 @@ fn build_widgets(
     let textures_title_label = gtk::Label::new(Some("Select a package from the left pane."));
     textures_title_label.set_xalign(0.0);
     textures_title_label.set_wrap(true);
+    let textures_search_entry = gtk::SearchEntry::new();
+    textures_search_entry.set_placeholder_text(Some("Search current section"));
+    textures_search_entry.set_visible(false);
+    let textures_nav_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let textures_back_button = gtk::Button::with_label("Up");
+    let textures_path_label = gtk::Label::new(None);
+    textures_path_label.set_xalign(0.0);
+    textures_path_label.set_wrap(true);
+    textures_path_label.set_hexpand(true);
+    let textures_notice_label = gtk::Label::new(None);
+    textures_notice_label.set_xalign(0.0);
+    textures_notice_label.set_wrap(true);
+    textures_notice_label.add_css_class("caption");
+    textures_back_button.set_visible(false);
+    textures_nav_row.append(&textures_back_button);
+    textures_nav_row.append(&textures_path_label);
     let texture_list_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let textures_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -2274,6 +2963,9 @@ fn build_widgets(
         .child(&texture_list_box)
         .build();
     textures_panel.append(&textures_title_label);
+    textures_panel.append(&textures_search_entry);
+    textures_panel.append(&textures_nav_row);
+    textures_panel.append(&textures_notice_label);
     textures_panel.append(&textures_scroll);
 
     let preview_panel = build_panel_box("Preview");
@@ -2423,6 +3115,10 @@ fn build_widgets(
         move_here_button,
         package_list_box,
         textures_title_label,
+        textures_search_entry,
+        textures_path_label,
+        textures_back_button,
+        textures_notice_label,
         texture_list_box,
         preview_asset_label,
         preview_texture_label,
@@ -2538,6 +3234,171 @@ fn build_tree_button(label: &str, depth: i32, selected: bool, folder: bool) -> g
         button.add_css_class("suggested-action");
     }
     button
+}
+
+fn append_texture_rows(
+    container: &gtk::Box,
+    textures: &[TextureEntry],
+    selected_texture: Option<usize>,
+) {
+    for (index, texture) in textures.iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        row.add_css_class("boxed-list-row");
+        row.set_margin_top(4);
+        row.set_margin_bottom(4);
+        row.set_margin_start(4);
+        row.set_margin_end(4);
+
+        let button = gtk::Button::with_label(&format!(
+            "{} ({})",
+            texture.name,
+            texture.width_height_label()
+        ));
+        button.set_halign(gtk::Align::Fill);
+        button.set_hexpand(true);
+        if selected_texture == Some(index) {
+            button.add_css_class("suggested-action");
+        }
+        button.connect_clicked(move |_| {
+            with_app(|app| {
+                app.select_texture(index);
+            });
+        });
+
+        let details = gtk::Label::new(Some(&format!(
+            "{} | {} | {} mips",
+            texture.file_name,
+            texture.format.label(),
+            texture.mips
+        )));
+        details.set_wrap(true);
+        details.set_xalign(0.0);
+        if texture.modified {
+            details.add_css_class("accent");
+        }
+
+        row.append(&button);
+        row.append(&details);
+        container.append(&row);
+    }
+}
+
+fn append_archive_rows(
+    container: &gtk::Box,
+    asset_index: usize,
+    node: &RpfTreeNode,
+    expanded_paths: &HashSet<String>,
+    filter_query: Option<&str>,
+    depth: i32,
+) -> usize {
+    let mut children = node.children.iter().collect::<Vec<_>>();
+    children.sort_by_key(|child| {
+        (
+            match child.kind {
+                RpfTreeNodeKind::Folder => 0,
+                RpfTreeNodeKind::Package => 1,
+                RpfTreeNodeKind::File => 2,
+            },
+            child.name.to_ascii_lowercase(),
+        )
+    });
+    if let Some(filter_query) = filter_query {
+        children.retain(|child| archive_name_matches_query(&child.name, filter_query));
+    }
+
+    let mut rendered_rows = 0;
+
+    for child in children {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.set_margin_top(2);
+        row.set_margin_bottom(2);
+        row.set_margin_start((depth * 18).max(0));
+        row.set_margin_end(4);
+
+        let is_branch = matches!(
+            child.kind,
+            RpfTreeNodeKind::Folder | RpfTreeNodeKind::Package
+        );
+        if is_branch {
+            let toggle_label = if expanded_paths.contains(&child.path) {
+                "-"
+            } else {
+                "+"
+            };
+            let toggle_button = gtk::Button::with_label(toggle_label);
+            toggle_button.add_css_class("flat");
+            let child_path = child.path.clone();
+            toggle_button.connect_clicked(move |_| {
+                with_app(|app| {
+                    app.toggle_archive_path_expanded(asset_index, &child_path);
+                });
+            });
+            row.append(&toggle_button);
+        }
+
+        let label_prefix = match child.kind {
+            RpfTreeNodeKind::Folder => "[Folder] ",
+            RpfTreeNodeKind::Package => "[Package] ",
+            RpfTreeNodeKind::File => "[File] ",
+        };
+        let button = gtk::Button::with_label(&format!("{}{}", label_prefix, child.name));
+        button.set_halign(gtk::Align::Fill);
+        button.set_hexpand(true);
+        let child_path = child.path.clone();
+        match child.kind {
+            RpfTreeNodeKind::Folder | RpfTreeNodeKind::Package => {
+                button.connect_clicked(move |_| {
+                    with_app(|app| {
+                        app.browse_archive_path(asset_index, child_path.clone());
+                    });
+                });
+            }
+            RpfTreeNodeKind::File => {
+                button.connect_clicked(move |_| {
+                    with_app(|app| {
+                        app.open_archive_file(asset_index, child_path.clone());
+                    });
+                });
+            }
+        }
+        row.append(&button);
+        container.append(&row);
+        rendered_rows += 1;
+
+        if is_branch && expanded_paths.contains(&child.path) {
+            rendered_rows += append_archive_rows(
+                container,
+                asset_index,
+                child,
+                expanded_paths,
+                filter_query,
+                depth + 1,
+            );
+        }
+    }
+
+    rendered_rows
+}
+
+fn archive_name_matches_query(name: &str, filter_query: &str) -> bool {
+    name.to_ascii_lowercase().contains(filter_query)
+}
+
+fn find_archive_parent_path(
+    node: &RpfTreeNode,
+    path: &str,
+    parent_path: &mut Option<String>,
+) -> bool {
+    for child in &node.children {
+        if child.path == path {
+            *parent_path = Some(node.path.clone());
+            return true;
+        }
+        if find_archive_parent_path(child, path, parent_path) {
+            return true;
+        }
+    }
+    false
 }
 
 fn clear_box(container: &gtk::Box) {
@@ -2761,6 +3622,8 @@ fn present_asset_file_dialog(app: &Rc<RefCell<App>>) {
     filter.set_name(Some("GTA V assets"));
     filter.add_suffix("ydr");
     filter.add_suffix("yft");
+    filter.add_suffix("ytd");
+    filter.add_suffix("rpf");
     filters.append(&filter);
     dialog.set_filters(Some(&filters));
 
@@ -2895,7 +3758,24 @@ fn import_asset_draft(
     folder_id: u64,
 ) -> Result<ImportedAssetDraft> {
     let kind = AssetKind::from_path(asset_path)
-        .ok_or_else(|| anyhow!("Only .ydr and .yft files are supported for import"))?;
+        .ok_or_else(|| anyhow!("Only .ydr, .yft, .ytd, and .rpf files are supported for import"))?;
+
+    if kind == AssetKind::Rpf {
+        let archive_tree = list_rpf_tree(tool_paths, asset_path)?;
+        return Ok(ImportedAssetDraft {
+            id: format!(
+                "{}_{}",
+                sanitize_for_path(&asset_path.file_stem().unwrap_or_default().to_string_lossy()),
+                unix_timestamp_ms()
+            ),
+            source_path: asset_path.to_path_buf(),
+            kind,
+            folder_id,
+            xml_path: None,
+            textures: Vec::new(),
+            archive_tree: Some(archive_tree),
+        });
+    }
 
     let asset_name = asset_path
         .file_name()
@@ -2926,15 +3806,16 @@ fn import_asset_draft(
 
     copy_dir_recursive(&template_dir, &working_dir)?;
     let xml_path = working_dir.join(format!("{}.xml", asset_name));
-    let textures = parse_textures_from_xml(&xml_path, &working_dir, &preview_dir)?;
+    let textures = parse_textures_from_xml(&xml_path, &working_dir, &preview_dir, true)?;
 
     Ok(ImportedAssetDraft {
         id: session_id,
         source_path: asset_path.to_path_buf(),
         kind,
         folder_id,
-        xml_path,
+        xml_path: Some(xml_path),
         textures,
+        archive_tree: None,
     })
 }
 
@@ -2942,6 +3823,7 @@ fn parse_textures_from_xml(
     xml_path: &Path,
     working_dir: &Path,
     preview_dir: &Path,
+    require_textures: bool,
 ) -> Result<Vec<TextureEntryDraft>> {
     let xml = fs::read_to_string(xml_path)
         .with_context(|| format!("Failed to read {}", xml_path.display()))?;
@@ -2997,11 +3879,76 @@ fn parse_textures_from_xml(
         });
     }
 
-    if textures.is_empty() {
+    if require_textures && textures.is_empty() {
         bail!("No DDS textures were found in {}", xml_path.display());
     }
 
     Ok(textures)
+}
+
+fn list_rpf_tree(tool_paths: &ToolPaths, rpf_path: &Path) -> Result<RpfTreeNode> {
+    let output = Command::new(&tool_paths.cwassettool_bin)
+        .arg("list-rpf")
+        .arg(rpf_path)
+        .output()
+        .with_context(|| format!("Failed to inspect {}", rpf_path.display()))?;
+
+    if !output.status.success() {
+        ensure_success("cwassettool list-rpf", output)?;
+        unreachable!();
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("Invalid UTF-8 from cwassettool")?;
+    serde_json::from_str(&stdout).context("Failed to parse RPF tree JSON")
+}
+
+fn export_archive_entry_draft(
+    tool_paths: &ToolPaths,
+    rpf_path: &Path,
+    entry_path: &str,
+) -> Result<ImportedArchiveEntryDraft> {
+    let session_id = format!(
+        "{}_{}",
+        sanitize_for_path(entry_path.split('\\').last().unwrap_or(entry_path)),
+        unix_timestamp_ms()
+    );
+    let session_dir = tool_paths.workspace_dir.join("imports").join(&session_id);
+    let template_dir = session_dir.join("template");
+    let working_dir = session_dir.join("current");
+    let preview_dir = session_dir.join("previews");
+    fs::create_dir_all(&session_dir)?;
+    fs::create_dir_all(&preview_dir)?;
+
+    let output = Command::new(&tool_paths.cwassettool_bin)
+        .arg("export-rpf-entry")
+        .arg(rpf_path)
+        .arg(entry_path)
+        .arg(&template_dir)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to export {} from {}",
+                entry_path,
+                rpf_path.display()
+            )
+        })?;
+    ensure_success("cwassettool export-rpf-entry", output)?;
+
+    let entry_name = entry_path
+        .split('\\')
+        .next_back()
+        .context("Archive entry path did not contain a file name")?
+        .to_owned();
+    copy_dir_recursive(&template_dir, &working_dir)?;
+    let xml_path = working_dir.join(format!("{}.xml", entry_name));
+    let textures = parse_textures_from_xml(&xml_path, &working_dir, &preview_dir, false)?;
+
+    Ok(ImportedArchiveEntryDraft {
+        entry_path: entry_path.to_owned(),
+        title: entry_name,
+        xml_path,
+        textures,
+    })
 }
 
 fn child_text(node: roxmltree::Node<'_, '_>, tag_name: &str) -> Option<String> {
@@ -3169,6 +4116,41 @@ fn save_asset_build_job(
         .output()
         .with_context(|| format!("Failed to build {}", output_path.display()))?;
     ensure_success("cwassettool import", output)?;
+    Ok(output_path.to_path_buf())
+}
+
+fn save_rpf_build_job(
+    tool_paths: &ToolPaths,
+    source_path: &Path,
+    output_path: &Path,
+    changes: Vec<RpfBuildChange>,
+) -> Result<PathBuf> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let manifest_path = tool_paths
+        .workspace_dir
+        .join("imports")
+        .join(format!("rpf_build_{}.json", unix_timestamp_ms()));
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&RpfBuildManifest { changes })?,
+    )?;
+
+    let output = Command::new(&tool_paths.cwassettool_bin)
+        .arg("build-rpf")
+        .arg(source_path)
+        .arg(output_path)
+        .arg(&manifest_path)
+        .output()
+        .with_context(|| format!("Failed to build {}", output_path.display()))?;
+    let result = ensure_success("cwassettool build-rpf", output);
+    let _ = fs::remove_file(&manifest_path);
+    result?;
     Ok(output_path.to_path_buf())
 }
 

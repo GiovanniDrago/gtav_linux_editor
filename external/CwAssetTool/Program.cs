@@ -1,5 +1,12 @@
+using System.Text.Json;
 using CodeWalker.GameFiles;
 using CodeWalker.Utils;
+
+var jsonOptions = new JsonSerializerOptions
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    WriteIndented = true,
+};
 
 static int Usage()
 {
@@ -8,10 +15,19 @@ static int Usage()
     Console.Error.WriteLine("  cwassettool inspect-dds <dds>");
     Console.Error.WriteLine("  cwassettool export <asset> <output-dir>");
     Console.Error.WriteLine("  cwassettool import <xml> <output-asset>");
+    Console.Error.WriteLine("  cwassettool list-rpf <archive.rpf>");
+    Console.Error.WriteLine("  cwassettool export-rpf-entry <archive.rpf> <entry-path> <output-dir>");
+    Console.Error.WriteLine("  cwassettool build-rpf <source.rpf> <output.rpf> <changes.json>");
     return 1;
 }
 
 static string FullPath(string path) => Path.GetFullPath(path);
+
+static bool IsSupportedAssetExtension(string extension) => extension switch
+{
+    ".ydr" or ".yft" or ".ytd" => true,
+    _ => false,
+};
 
 static IEnumerable<Texture> EnumerateTextures(string assetPath)
 {
@@ -84,13 +100,10 @@ static int InspectDds(string ddsPath)
     return 0;
 }
 
-static int ExportAsset(string assetPath, string outputDir)
+static string ExportAssetBytes(string assetName, string ext, byte[] data, string outputDir)
 {
     Directory.CreateDirectory(outputDir);
-
-    var data = File.ReadAllBytes(assetPath);
-    var ext = Path.GetExtension(assetPath).ToLowerInvariant();
-    var xmlPath = Path.Combine(outputDir, Path.GetFileName(assetPath) + ".xml");
+    var xmlPath = Path.Combine(outputDir, assetName + ".xml");
 
     string xml = ext switch
     {
@@ -101,6 +114,14 @@ static int ExportAsset(string assetPath, string outputDir)
     };
 
     File.WriteAllText(xmlPath, xml);
+    return xmlPath;
+}
+
+static int ExportAsset(string assetPath, string outputDir)
+{
+    var data = File.ReadAllBytes(assetPath);
+    var ext = Path.GetExtension(assetPath).ToLowerInvariant();
+    var xmlPath = ExportAssetBytes(Path.GetFileName(assetPath), ext, data, outputDir);
     Console.WriteLine($"xml={xmlPath}");
     return 0;
 }
@@ -126,22 +147,191 @@ static string ExportYtd(byte[] data, string outputDir)
     return YtdXml.GetXml(ytd, outputDir);
 }
 
-static int ImportAsset(string xmlPath, string outputAssetPath)
+static byte[] ImportAssetBytes(string xmlPath, string ext)
 {
     var xml = File.ReadAllText(xmlPath);
     var inputDir = Path.GetDirectoryName(xmlPath) ?? Environment.CurrentDirectory;
-    var ext = Path.GetExtension(outputAssetPath).ToLowerInvariant();
 
-    byte[] data = ext switch
+    return ext switch
     {
         ".ydr" => XmlYdr.GetYdr(xml, inputDir).Save(),
         ".yft" => XmlYft.GetYft(xml, inputDir).Save(),
         ".ytd" => XmlYtd.GetYtd(xml, inputDir).Save(),
         _ => throw new InvalidOperationException($"Unsupported asset type: {ext}")
     };
+}
 
+static int ImportAsset(string xmlPath, string outputAssetPath)
+{
+    var ext = Path.GetExtension(outputAssetPath).ToLowerInvariant();
+    var data = ImportAssetBytes(xmlPath, ext);
     File.WriteAllBytes(outputAssetPath, data);
     Console.WriteLine($"asset={outputAssetPath}");
+    return 0;
+}
+
+static RpfFile LoadRpf(string rpfPath)
+{
+    var file = new RpfFile(rpfPath, Path.GetFileName(rpfPath));
+    file.ScanStructure(null, null);
+    if (file.LastException != null)
+    {
+        throw file.LastException;
+    }
+    return file;
+}
+
+static RpfManager CreateRpfManager(RpfFile rootFile)
+{
+    var allRpfs = new List<RpfFile>();
+    var stack = new Stack<RpfFile>();
+    stack.Push(rootFile);
+
+    while (stack.Count > 0)
+    {
+        var file = stack.Pop();
+        allRpfs.Add(file);
+
+        if (file.Children == null)
+        {
+            continue;
+        }
+
+        for (var index = file.Children.Count - 1; index >= 0; index--)
+        {
+            stack.Push(file.Children[index]);
+        }
+    }
+
+    var manager = new RpfManager();
+    manager.Init(allRpfs, false);
+    return manager;
+}
+
+static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile archive, string parentDisplayPath)
+{
+    var children = new List<RpfTreeNode>();
+
+    foreach (var childDirectory in directory.Directories.OrderBy(dir => dir.Name, StringComparer.OrdinalIgnoreCase))
+    {
+        var childDisplayPath = parentDisplayPath + " / " + childDirectory.Name;
+        children.Add(new RpfTreeNode(
+            childDirectory.Name,
+            childDirectory.Path,
+            childDisplayPath,
+            "folder",
+            false,
+            BuildRpfChildren(childDirectory, archive, childDisplayPath)
+        ));
+    }
+
+    foreach (var childFile in directory.Files.OrderBy(file => file.Name, StringComparer.OrdinalIgnoreCase))
+    {
+        var childArchive = archive.Children?.FirstOrDefault(candidate => candidate.ParentFileEntry?.Path == childFile.Path);
+        var childDisplayPath = parentDisplayPath + " / " + childFile.Name;
+        if (childArchive != null)
+        {
+            children.Add(BuildRpfNode(childArchive, childDisplayPath));
+        }
+        else
+        {
+            children.Add(new RpfTreeNode(
+                childFile.Name,
+                childFile.Path,
+                childDisplayPath,
+                "file",
+                IsSupportedAssetExtension(Path.GetExtension(childFile.Name).ToLowerInvariant()),
+                new List<RpfTreeNode>()
+            ));
+        }
+    }
+
+    return children;
+}
+
+static RpfTreeNode BuildRpfNode(RpfFile archive, string displayPath)
+{
+    return new RpfTreeNode(
+        archive.Name,
+        archive.Path,
+        displayPath,
+        "package",
+        false,
+        BuildRpfChildren(archive.Root, archive, displayPath)
+    );
+}
+
+static int ListRpf(string rpfPath, JsonSerializerOptions options)
+{
+    var root = LoadRpf(rpfPath);
+    var tree = BuildRpfNode(root, root.Name);
+    Console.WriteLine(JsonSerializer.Serialize(tree, options));
+    return 0;
+}
+
+static int ExportRpfEntry(string rpfPath, string entryPath, string outputDir)
+{
+    var root = LoadRpf(rpfPath);
+    var manager = CreateRpfManager(root);
+    var entry = manager.GetEntry(entryPath) as RpfFileEntry
+        ?? throw new InvalidOperationException($"RPF entry not found: {entryPath}");
+    var ext = Path.GetExtension(entry.Name).ToLowerInvariant();
+    if (!IsSupportedAssetExtension(ext))
+    {
+        throw new InvalidOperationException($"Unsupported archive entry type: {ext}");
+    }
+
+    var data = GetRpfEntryExportData(entry);
+    var xmlPath = ExportAssetBytes(entry.Name, ext, data, outputDir);
+    Console.WriteLine($"xml={xmlPath}");
+    return 0;
+}
+
+static byte[] GetRpfEntryExportData(RpfFileEntry entry)
+{
+    var data = entry.File.ExtractFile(entry)
+        ?? throw new InvalidOperationException($"Unable to extract archive entry: {entry.Path}");
+
+    if (entry is RpfResourceFileEntry resourceEntry)
+    {
+        data = ResourceBuilder.Compress(data);
+        data = ResourceBuilder.AddResourceHeader(resourceEntry, data);
+    }
+
+    return data;
+}
+
+static int BuildRpf(string sourceRpfPath, string outputRpfPath, string manifestPath, JsonSerializerOptions options)
+{
+    var manifest = JsonSerializer.Deserialize<RpfBuildManifest>(File.ReadAllText(manifestPath), options)
+        ?? throw new InvalidOperationException("Unable to parse build manifest.");
+
+    Directory.CreateDirectory(Path.GetDirectoryName(outputRpfPath) ?? Environment.CurrentDirectory);
+    if (File.Exists(outputRpfPath))
+    {
+        File.Delete(outputRpfPath);
+    }
+    File.Copy(sourceRpfPath, outputRpfPath);
+
+    foreach (var change in manifest.Changes)
+    {
+        var root = LoadRpf(outputRpfPath);
+        RpfFile.EnsureValidEncryption(root, _ => true, true);
+        var manager = CreateRpfManager(root);
+        var entry = manager.GetEntry(change.EntryPath) as RpfFileEntry
+            ?? throw new InvalidOperationException($"RPF entry not found: {change.EntryPath}");
+
+        if (entry.Parent == null)
+        {
+            throw new InvalidOperationException($"RPF entry has no parent directory: {change.EntryPath}");
+        }
+
+        var ext = Path.GetExtension(entry.Name).ToLowerInvariant();
+        var data = ImportAssetBytes(change.XmlPath, ext);
+        RpfFile.CreateFile(entry.Parent, entry.Name, data);
+    }
+
+    Console.WriteLine($"asset={outputRpfPath}");
     return 0;
 }
 
@@ -160,6 +350,9 @@ try
         "inspect-dds" when args.Length == 2 => InspectDds(FullPath(args[1])),
         "export" when args.Length == 3 => ExportAsset(FullPath(args[1]), FullPath(args[2])),
         "import" when args.Length == 3 => ImportAsset(FullPath(args[1]), FullPath(args[2])),
+        "list-rpf" when args.Length == 2 => ListRpf(FullPath(args[1]), jsonOptions),
+        "export-rpf-entry" when args.Length == 4 => ExportRpfEntry(FullPath(args[1]), args[2], FullPath(args[3])),
+        "build-rpf" when args.Length == 4 => BuildRpf(FullPath(args[1]), FullPath(args[2]), FullPath(args[3]), jsonOptions),
         _ => Usage()
     };
 }
@@ -168,3 +361,16 @@ catch (Exception ex)
     Console.Error.WriteLine(ex.Message);
     return 1;
 }
+
+record RpfTreeNode(
+    string Name,
+    string Path,
+    string DisplayPath,
+    string Kind,
+    bool SupportedAsset,
+    List<RpfTreeNode> Children
+);
+
+record RpfBuildManifest(List<RpfBuildChange> Changes);
+
+record RpfBuildChange(string EntryPath, string XmlPath);
