@@ -1,0 +1,7 @@
+/target/
+/.tool_workspace/
+/builds/
+/.workspace/
+/external/CodeWalker/
+/external/CwAssetTool/bin/
+/external/CwAssetTool/obj/

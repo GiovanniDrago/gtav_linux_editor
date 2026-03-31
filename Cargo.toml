@@ -1,0 +1,13 @@
+[package]
+name = "gtav_texture_importer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+adw = { package = "libadwaita", version = "0.9.1", features = ["v1_8", "gtk_v4_20"] }
+gtk = { package = "gtk4", version = "0.11.1", features = ["v4_20"] }
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
+roxmltree = "0.20.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
