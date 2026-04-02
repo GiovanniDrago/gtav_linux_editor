@@ -9,8 +9,9 @@ The app is focused on a safe workflow:
 - import assets without changing the originals
 - inspect textures contained inside the asset or a supported file inside an archive
 - replace one texture with one or more user images
-- rebuild the final asset into `builds/`
+- apply changes back into the original selected file
 - rebuild the full original `.rpf` archive when edited files came from inside an archive
+- optionally create a `.bak` backup before replacing the original file
 - optionally copy built outputs elsewhere while preserving the fake folder structure created in the UI
 
 ## Core Dependency Model
@@ -54,10 +55,11 @@ The Rust app does not directly implement GTA V asset parsing/writing. It orchest
 3. If `CodeWalker` is missing, the app can download it from:
    - `https://github.com/dexyfex/CodeWalker`
 4. The app builds `CwAssetTool` locally.
-5. After setup, the user imports `.ydr`, `.yft`, `.ytd`, or `.rpf` files.
-6. If the import is an archive, the user browses folders/packages in the middle pane, searches within the current section, and opens a supported embedded file.
-7. The user selects a texture, edits it, applies changes, and saves rebuilt outputs into `builds/`.
-8. For archive edits, the saved output is a rebuilt copy of the original `.rpf` containing the edited internal files.
+5. After setup, the user configures the GTA V mods folder path.
+6. The left pane browses the real mods-folder contents and the user opens a supported `.ydr`, `.yft`, `.ytd`, or `.rpf` file from there.
+7. If the selection is an archive, the user browses folders/packages in the middle pane, searches within the current section, and opens a supported embedded file.
+8. The user selects a texture, edits it, applies changes, and saves from the file row in the left pane.
+9. For archive edits, the saved output is a rebuilt copy of the original `.rpf` that replaces the original file after the write succeeds.
 
 ## Important Design Assumptions
 

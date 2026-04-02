@@ -23,6 +23,46 @@ static int Usage()
 
 static string FullPath(string path) => Path.GetFullPath(path);
 
+static (string RootPath, bool Gen9)? FindGameRoot(string path)
+{
+    var current = new FileInfo(path).Directory;
+    while (current != null)
+    {
+        if (Directory.EnumerateFiles(current.FullName)
+            .Select(Path.GetFileName)
+            .Any(name => string.Equals(name, "gta5.exe", StringComparison.OrdinalIgnoreCase)))
+        {
+            return (current.FullName, false);
+        }
+        if (Directory.EnumerateFiles(current.FullName)
+            .Select(Path.GetFileName)
+            .Any(name => string.Equals(name, "gta5_enhanced.exe", StringComparison.OrdinalIgnoreCase)))
+        {
+            return (current.FullName, true);
+        }
+        current = current.Parent;
+    }
+
+    return null;
+}
+
+static void EnsureGameKeys(string path)
+{
+    var gameRoot = FindGameRoot(path);
+    if (gameRoot == null)
+    {
+        return;
+    }
+
+    if (string.Equals(KeyLoadState.LoadedKeysRoot, gameRoot.Value.RootPath, StringComparison.OrdinalIgnoreCase))
+    {
+        return;
+    }
+
+    GTA5Keys.LoadFromPath(gameRoot.Value.RootPath, gameRoot.Value.Gen9, null);
+    KeyLoadState.LoadedKeysRoot = gameRoot.Value.RootPath;
+}
+
 static bool IsSupportedAssetExtension(string extension) => extension switch
 {
     ".ydr" or ".yft" or ".ytd" => true,
@@ -172,11 +212,23 @@ static int ImportAsset(string xmlPath, string outputAssetPath)
 
 static RpfFile LoadRpf(string rpfPath)
 {
+    EnsureGameKeys(rpfPath);
     var file = new RpfFile(rpfPath, Path.GetFileName(rpfPath));
-    file.ScanStructure(null, null);
+    var loadErrors = new List<string>();
+    file.ScanStructure(null, message => loadErrors.Add(message));
     if (file.LastException != null)
     {
-        throw file.LastException;
+        var detail = loadErrors.LastOrDefault()
+            ?? file.LastError
+            ?? file.LastException.Message;
+        throw new InvalidOperationException(
+            $"Failed to scan RPF {rpfPath}: {detail}",
+            file.LastException
+        );
+    }
+    if (file.Root == null)
+    {
+        throw new InvalidOperationException($"RPF {rpfPath} did not expose a root directory.");
     }
     return file;
 }
@@ -210,6 +262,11 @@ static RpfManager CreateRpfManager(RpfFile rootFile)
 
 static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile archive, string parentDisplayPath)
 {
+    if (directory == null)
+    {
+        throw new InvalidOperationException($"RPF directory tree was missing for {parentDisplayPath}.");
+    }
+
     var children = new List<RpfTreeNode>();
 
     foreach (var childDirectory in directory.Directories.OrderBy(dir => dir.Name, StringComparer.OrdinalIgnoreCase))
@@ -227,8 +284,12 @@ static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile a
 
     foreach (var childFile in directory.Files.OrderBy(file => file.Name, StringComparer.OrdinalIgnoreCase))
     {
-        var childArchive = archive.Children?.FirstOrDefault(candidate => candidate.ParentFileEntry?.Path == childFile.Path);
-        var childDisplayPath = parentDisplayPath + " / " + childFile.Name;
+        var childFileName = childFile.Name
+            ?? childFile.Path?.Split('\\').LastOrDefault()
+            ?? "(unnamed file)";
+        var childFilePath = childFile.Path ?? string.Empty;
+        var childArchive = archive.Children?.FirstOrDefault(candidate => candidate.ParentFileEntry?.Path == childFilePath);
+        var childDisplayPath = parentDisplayPath + " / " + childFileName;
         if (childArchive != null)
         {
             children.Add(BuildRpfNode(childArchive, childDisplayPath));
@@ -236,11 +297,11 @@ static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile a
         else
         {
             children.Add(new RpfTreeNode(
-                childFile.Name,
-                childFile.Path,
+                childFileName,
+                childFilePath,
                 childDisplayPath,
                 "file",
-                IsSupportedAssetExtension(Path.GetExtension(childFile.Name).ToLowerInvariant()),
+                IsSupportedAssetExtension((Path.GetExtension(childFileName) ?? string.Empty).ToLowerInvariant()),
                 new List<RpfTreeNode>()
             ));
         }
@@ -251,9 +312,14 @@ static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile a
 
 static RpfTreeNode BuildRpfNode(RpfFile archive, string displayPath)
 {
+    if (archive.Root == null)
+    {
+        throw new InvalidOperationException($"RPF archive {archive.FilePath} has no root directory.");
+    }
+
     return new RpfTreeNode(
-        archive.Name,
-        archive.Path,
+        archive.Name ?? Path.GetFileName(archive.FilePath) ?? "(archive)",
+        archive.Path ?? archive.FilePath ?? string.Empty,
         displayPath,
         "package",
         false,
@@ -374,3 +440,8 @@ record RpfTreeNode(
 record RpfBuildManifest(List<RpfBuildChange> Changes);
 
 record RpfBuildChange(string EntryPath, string XmlPath);
+
+static class KeyLoadState
+{
+    public static string LoadedKeysRoot = string.Empty;
+}

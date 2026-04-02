@@ -7,7 +7,7 @@ The app bundles its own `CwAssetTool` source in `external/CwAssetTool/`, downloa
 ## What it does
 
 - Imports one or more `.ydr`, `.yft`, `.ytd`, and `.rpf` packages without touching the originals.
-- Lets you create fake folders in the package tree and move imported files between them.
+- Opens a configured GTA V mods folder and browses its real folders and supported asset files.
 - Uses a GNOME-style application window instead of the previous custom window chrome.
 - Starts with a setup wizard the first time the app runs, and can rerun it later from the app menu.
 - Shows package files, `.rpf` archive contents, textures, and previews in three horizontally resizable panes.
@@ -16,8 +16,9 @@ The app bundles its own `CwAssetTool` source in `external/CwAssetTool/`, downloa
 - Uses a recursive split editor where `Add Row` and `Add Column` apply only to the selected section, and repeated adds on the same axis create equal-sized siblings.
 - Lets you remove rows and columns from the currently targeted section without rebuilding the whole layout.
 - Keeps the last used folder for asset import, image import, and copy-destination picking while the app is running.
-- Offers an app menu with external update checks and theme selection.
-- Saves rebuilt assets into `builds/`, including full rebuilt `.rpf` archives when archive contents were changed.
+- Offers a collapsible settings drawer with external update checks, theme selection, mods-folder setup, backup preference, and copy destination settings.
+- Applies saves back into the original file location, rebuilding full `.rpf` archives when archive contents were changed.
+- Can optionally create a `.bak` backup before writing changes back to the original file.
 - Copies all built assets into a user-defined destination while preserving the fake folder structure.
 
 ## Docs

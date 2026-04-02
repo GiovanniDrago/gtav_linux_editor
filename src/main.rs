@@ -10,11 +10,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use gtk::gdk;
 use gtk::gio;
 use gtk::glib;
-use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage, imageops::FilterType};
+use image::{imageops::FilterType, DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use roxmltree::Document;
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +169,8 @@ struct AppConfig {
     setup_complete: bool,
     copy_destination: String,
     theme: ThemePreference,
+    mod_folder_path: Option<PathBuf>,
+    backup_before_save: bool,
     last_asset_dir: Option<PathBuf>,
     last_image_dir: Option<PathBuf>,
     last_copy_dir: Option<PathBuf>,
@@ -180,6 +182,8 @@ impl Default for AppConfig {
             setup_complete: false,
             copy_destination: String::new(),
             theme: ThemePreference::System,
+            mod_folder_path: None,
+            backup_before_save: true,
             last_asset_dir: None,
             last_image_dir: None,
             last_copy_dir: None,
@@ -819,7 +823,10 @@ struct PixelRect {
 }
 
 enum JobResult {
-    ImportFinished(std::result::Result<ImportedAssetDraft, String>),
+    ImportFinished {
+        source_path: PathBuf,
+        result: std::result::Result<ImportedAssetDraft, String>,
+    },
     OpenArchiveEntryFinished {
         asset_id: String,
         entry_path: String,
@@ -849,10 +856,17 @@ enum JobResult {
 
 struct AppWidgets {
     window: adw::ApplicationWindow,
-    app_menu_button: gtk::MenuButton,
+    toast_overlay: adw::ToastOverlay,
+    app_menu_button: gtk::ToggleButton,
+    settings_backdrop: gtk::Button,
+    settings_revealer: gtk::Revealer,
     rerun_setup_button: gtk::Button,
     check_updates_button: gtk::Button,
     theme_dropdown: gtk::DropDown,
+    mod_folder_path_label: gtk::Label,
+    open_mod_folder_button: gtk::Button,
+    change_mod_folder_button: gtk::Button,
+    backup_before_save_check: gtk::CheckButton,
     back_button: gtk::Button,
     import_button: gtk::Button,
     save_button: gtk::Button,
@@ -861,6 +875,8 @@ struct AppWidgets {
     settings_button: gtk::Button,
     status_label: gtk::Label,
     stack: gtk::Stack,
+    browser_main_paned: gtk::Paned,
+    packages_panel: gtk::Box,
     package_target_label: gtk::Label,
     new_folder_entry: gtk::Entry,
     create_folder_button: gtk::Button,
@@ -905,6 +921,9 @@ struct App {
     folders: Vec<FolderNode>,
     next_folder_id: u64,
     selected_folder_id: u64,
+    mod_tree_expanded_paths: HashSet<PathBuf>,
+    selected_mod_path: Option<PathBuf>,
+    pending_import_paths: HashSet<PathBuf>,
     assets: Vec<ImportedAsset>,
     selected_asset: Option<usize>,
     selected_texture: Option<usize>,
@@ -939,6 +958,9 @@ impl App {
             folders: Vec::new(),
             next_folder_id: 1,
             selected_folder_id: ROOT_FOLDER_ID,
+            mod_tree_expanded_paths: HashSet::new(),
+            selected_mod_path: None,
+            pending_import_paths: HashSet::new(),
             assets: Vec::new(),
             selected_asset: None,
             selected_texture: None,
@@ -947,7 +969,7 @@ impl App {
             last_image_dir: None,
             last_copy_dir: None,
             pending_jobs: 0,
-            status: "Ready. Import .ydr, .yft, .ytd, or .rpf files to begin.".to_owned(),
+            status: "Ready. Choose the GTA V mods folder to begin.".to_owned(),
             job_tx,
             job_rx,
             widgets,
@@ -958,6 +980,9 @@ impl App {
             borrowed.last_asset_dir = borrowed.config.last_asset_dir.clone();
             borrowed.last_image_dir = borrowed.config.last_image_dir.clone();
             borrowed.last_copy_dir = borrowed.config.last_copy_dir.clone();
+            if let Some(path) = borrowed.config.mod_folder_path.clone() {
+                borrowed.mod_tree_expanded_paths.insert(path);
+            }
         }
 
         connect_signals(&app);
@@ -988,6 +1013,52 @@ impl App {
         }
     }
 
+    fn show_toast(&self, message: impl AsRef<str>) {
+        self.widgets
+            .toast_overlay
+            .add_toast(adw::Toast::new(message.as_ref()));
+    }
+
+    fn mods_root_path(&self) -> Option<&Path> {
+        self.config
+            .mod_folder_path
+            .as_deref()
+            .filter(|path| path.is_dir())
+    }
+
+    fn set_mod_folder_path(&mut self, path: PathBuf) {
+        self.config.mod_folder_path = Some(path.clone());
+        self.mod_tree_expanded_paths.clear();
+        self.mod_tree_expanded_paths.insert(path.clone());
+        self.selected_mod_path = None;
+        self.pending_import_paths.clear();
+        self.assets.clear();
+        self.selected_asset = None;
+        self.selected_texture = None;
+        self.editor = None;
+        self.close_settings_panel();
+        self.persist_config();
+        self.set_status(format!("Using GTA V mods folder at {}", path.display()));
+        self.show_toast("GTA V mods folder updated.");
+        self.refresh_all();
+    }
+
+    fn close_settings_panel(&self) {
+        sync_settings_panel_visibility(&self.widgets, false);
+        self.widgets.app_menu_button.set_active(false);
+    }
+
+    fn open_mods_root_folder(&mut self) {
+        let Some(directory) = self.mods_root_path() else {
+            self.set_status("Choose a GTA V mods folder first.");
+            return;
+        };
+
+        if let Err(error) = open_directory(directory) {
+            self.set_status(format!("Failed to open folder: {error:#}"));
+        }
+    }
+
     fn rerun_setup_wizard(&mut self) {
         self.setup_step = SetupStep::Welcome;
         self.widgets.stack.set_visible_child_name("setup");
@@ -997,40 +1068,31 @@ impl App {
     fn refresh_header(&self) {
         let in_editor = self.editor.is_some();
         let setup_required = self.setup_required();
-        let can_save = self
-            .selected_asset
-            .and_then(|index| self.assets.get(index))
-            .is_some_and(|asset| asset.dirty);
-        let can_open_build = self
-            .selected_asset
-            .and_then(|index| self.assets.get(index))
-            .and_then(|asset| asset.last_saved_path.as_ref())
-            .is_some();
-        let can_copy_all = self
-            .assets
-            .iter()
-            .any(|asset| asset.last_saved_path.is_some())
-            && !self.widgets.copy_destination_entry.text().trim().is_empty();
 
         self.widgets
             .back_button
             .set_visible(in_editor || setup_required);
         self.widgets.app_menu_button.set_sensitive(!in_editor);
+        let mod_folder_text = self
+            .config
+            .mod_folder_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Not configured".to_owned());
         self.widgets
-            .save_button
-            .set_sensitive(can_save && !in_editor && !setup_required);
+            .mod_folder_path_label
+            .set_text(&mod_folder_text);
         self.widgets
-            .open_build_folder_button
-            .set_sensitive(can_open_build && !in_editor && !setup_required);
+            .open_mod_folder_button
+            .set_sensitive(self.mods_root_path().is_some());
         self.widgets
-            .copy_all_button
-            .set_sensitive(can_copy_all && !in_editor && !setup_required);
-        self.widgets
-            .import_button
-            .set_sensitive(!in_editor && !setup_required);
-        self.widgets
-            .settings_button
-            .set_sensitive(!in_editor && !setup_required);
+            .backup_before_save_check
+            .set_active(self.config.backup_before_save);
+        self.widgets.save_button.set_visible(false);
+        self.widgets.open_build_folder_button.set_visible(false);
+        self.widgets.copy_all_button.set_visible(false);
+        self.widgets.import_button.set_visible(false);
+        self.widgets.settings_button.set_visible(false);
         self.widgets.edit_button.set_sensitive(
             !in_editor
                 && !setup_required
@@ -1217,18 +1279,6 @@ impl App {
         }
     }
 
-    fn folder_label(&self, folder_id: u64) -> String {
-        if folder_id == ROOT_FOLDER_ID {
-            return "Workspace".to_owned();
-        }
-
-        self.folders
-            .iter()
-            .find(|folder| folder.id == folder_id)
-            .map(|folder| folder.name.clone())
-            .unwrap_or_else(|| "Unknown folder".to_owned())
-    }
-
     fn folder_path_components(&self, folder_id: u64) -> Vec<String> {
         let mut current = folder_id;
         let mut parts = Vec::new();
@@ -1260,25 +1310,52 @@ impl App {
         }
     }
 
-    fn child_folder_ids(&self, parent_id: u64) -> Vec<u64> {
-        let mut folders: Vec<_> = self
-            .folders
+    fn asset_index_for_source_path(&self, path: &Path) -> Option<usize> {
+        self.assets
             .iter()
-            .filter_map(|folder| (folder.parent_id == parent_id).then_some(folder.id))
-            .collect();
-        folders.sort_by_key(|folder_id| self.folder_label(*folder_id).to_ascii_lowercase());
-        folders
+            .position(|asset| asset.source_path == path)
     }
 
-    fn asset_indices_in_folder(&self, folder_id: u64) -> Vec<usize> {
-        let mut indices: Vec<_> = self
-            .assets
-            .iter()
-            .enumerate()
-            .filter_map(|(index, asset)| (asset.folder_id == folder_id).then_some(index))
-            .collect();
-        indices.sort_by_key(|index| self.assets[*index].title().to_ascii_lowercase());
-        indices
+    fn toggle_mod_tree_path(&mut self, path: &Path) {
+        let path = path.to_path_buf();
+        if self.mod_tree_expanded_paths.contains(&path) {
+            self.mod_tree_expanded_paths.remove(&path);
+        } else {
+            self.mod_tree_expanded_paths.insert(path);
+        }
+        self.refresh_package_tree();
+    }
+
+    fn open_mod_asset_path(&mut self, path: PathBuf) {
+        self.selected_mod_path = Some(path.clone());
+
+        if let Some(asset_index) = self.asset_index_for_source_path(&path) {
+            self.select_asset(asset_index);
+            return;
+        }
+
+        if self.pending_import_paths.contains(&path) {
+            self.set_status(format!("Opening {}...", path.display()));
+            self.refresh_package_tree();
+            return;
+        }
+
+        self.pending_import_paths.insert(path.clone());
+        self.pending_jobs += 1;
+        self.set_status(format!("Opening {}...", path.display()));
+
+        let tool_paths = self.tool_paths.clone();
+        let tx = self.job_tx.clone();
+        thread::spawn(move || {
+            let result = import_asset_draft(&tool_paths, &path, ROOT_FOLDER_ID)
+                .map_err(|error| format!("{}", error));
+            let _ = tx.send(JobResult::ImportFinished {
+                source_path: path,
+                result,
+            });
+        });
+
+        self.refresh_package_tree();
     }
 
     fn active_archive_entry_path(&self, asset_index: usize) -> Option<String> {
@@ -1521,6 +1598,9 @@ impl App {
 
     fn select_asset(&mut self, asset_index: usize) {
         self.selected_asset = Some(asset_index);
+        if let Some(asset) = self.assets.get(asset_index) {
+            self.selected_mod_path = Some(asset.source_path.clone());
+        }
         if self.assets[asset_index].is_archive() {
             if self.assets[asset_index].archive_current_path.is_none() {
                 self.assets[asset_index].archive_current_path = self.assets[asset_index]
@@ -1603,53 +1683,70 @@ impl App {
             self.pending_jobs = self.pending_jobs.saturating_sub(1);
 
             match job {
-                JobResult::ImportFinished(result) => match result {
-                    Ok(draft) => {
-                        let asset = ImportedAsset {
-                            id: draft.id,
-                            source_path: draft.source_path,
-                            kind: draft.kind,
-                            folder_id: draft.folder_id,
-                            xml_path: draft.xml_path,
-                            textures: draft
-                                .textures
-                                .into_iter()
-                                .map(|texture| TextureEntry {
-                                    name: texture.name,
-                                    file_name: texture.file_name,
-                                    width: texture.width,
-                                    height: texture.height,
-                                    mips: texture.mips,
-                                    format: texture.format,
-                                    usage: texture.usage,
-                                    dds_path: texture.dds_path,
-                                    preview_png_path: texture.preview_png_path,
-                                    preview_texture: None,
-                                    preview_loading: false,
-                                    modified: false,
-                                })
-                                .collect(),
-                            archive_tree: draft.archive_tree,
-                            archive_entries: Vec::new(),
-                            archive_current_path: None,
-                            archive_expanded_paths: HashSet::new(),
-                            archive_selected_file: None,
-                            archive_file_notice: None,
-                            archive_file_loading_path: None,
-                            archive_search_query: String::new(),
-                            dirty: false,
-                            last_saved_path: None,
-                        };
+                JobResult::ImportFinished {
+                    source_path,
+                    result,
+                } => {
+                    self.pending_import_paths.remove(&source_path);
+                    match result {
+                        Ok(draft) => {
+                            if let Some(existing_index) =
+                                self.asset_index_for_source_path(&draft.source_path)
+                            {
+                                self.select_asset(existing_index);
+                                self.set_status(format!(
+                                    "Opened {}",
+                                    self.assets[existing_index].title()
+                                ));
+                                continue;
+                            }
 
-                        self.assets.push(asset);
-                        let new_index = self.assets.len() - 1;
-                        self.select_asset(new_index);
-                        self.set_status(format!("Imported {}", self.assets[new_index].title()));
+                            let asset = ImportedAsset {
+                                id: draft.id,
+                                source_path: draft.source_path,
+                                kind: draft.kind,
+                                folder_id: draft.folder_id,
+                                xml_path: draft.xml_path,
+                                textures: draft
+                                    .textures
+                                    .into_iter()
+                                    .map(|texture| TextureEntry {
+                                        name: texture.name,
+                                        file_name: texture.file_name,
+                                        width: texture.width,
+                                        height: texture.height,
+                                        mips: texture.mips,
+                                        format: texture.format,
+                                        usage: texture.usage,
+                                        dds_path: texture.dds_path,
+                                        preview_png_path: texture.preview_png_path,
+                                        preview_texture: None,
+                                        preview_loading: false,
+                                        modified: false,
+                                    })
+                                    .collect(),
+                                archive_tree: draft.archive_tree,
+                                archive_entries: Vec::new(),
+                                archive_current_path: None,
+                                archive_expanded_paths: HashSet::new(),
+                                archive_selected_file: None,
+                                archive_file_notice: None,
+                                archive_file_loading_path: None,
+                                archive_search_query: String::new(),
+                                dirty: false,
+                                last_saved_path: None,
+                            };
+
+                            self.assets.push(asset);
+                            let new_index = self.assets.len() - 1;
+                            self.select_asset(new_index);
+                            self.set_status(format!("Opened {}", self.assets[new_index].title()));
+                        }
+                        Err(error) => {
+                            self.set_status(format!("Import failed: {error}"));
+                        }
                     }
-                    Err(error) => {
-                        self.set_status(format!("Import failed: {error}"));
-                    }
-                },
+                }
                 JobResult::OpenArchiveEntryFinished {
                     asset_id,
                     entry_path,
@@ -1804,7 +1901,9 @@ impl App {
                                         texture.modified = false;
                                     }
                                 }
-                                self.set_status(format!("Saved build to {}", path.display()));
+                                let asset_title = asset.title();
+                                self.set_status(format!("Applied changes to {}", path.display()));
+                                self.show_toast(format!("Changes applied to {}.", asset_title));
                             }
                             Err(error) => {
                                 self.set_status(format!("Save failed: {error}"));
@@ -1887,12 +1986,44 @@ impl App {
     fn refresh_package_tree(&self) {
         clear_box(&self.widgets.package_list_box);
 
-        self.widgets.package_target_label.set_text(&format!(
-            "Target folder: {}",
-            self.folder_path_string(self.selected_folder_id)
-        ));
+        let Some(mods_root) = self.mods_root_path() else {
+            self.widgets.packages_panel.set_size_request(250, -1);
+            self.widgets.browser_main_paned.set_position(250);
+            self.widgets
+                .package_target_label
+                .set_text("GTA V mods folder not configured");
+            let empty_state = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            empty_state.set_margin_top(20);
+            empty_state.set_margin_bottom(12);
+            empty_state.set_margin_start(6);
+            empty_state.set_margin_end(6);
+            empty_state.add_css_class("card");
+            let choose_button = gtk::Button::from_icon_name("folder-open-symbolic");
+            choose_button.add_css_class("suggested-action");
+            choose_button.set_tooltip_text(Some("Choose GTA V mods folder"));
+            choose_button.connect_clicked(move |_| {
+                with_app_ref(|app| {
+                    present_mod_folder_dialog(&app);
+                });
+            });
+            choose_button.set_halign(gtk::Align::Start);
+            let message = gtk::Label::new(Some(
+                "The GTA V mods folder is required. It is important to make a backup before changing files.",
+            ));
+            message.set_xalign(0.0);
+            message.set_wrap(true);
+            empty_state.append(&choose_button);
+            empty_state.append(&message);
+            self.widgets.package_list_box.append(&empty_state);
+            return;
+        };
 
-        append_folder_rows(self, &self.widgets.package_list_box, ROOT_FOLDER_ID, 0);
+        self.widgets.packages_panel.set_size_request(320, -1);
+        self.widgets.browser_main_paned.set_position(360);
+        self.widgets
+            .package_target_label
+            .set_text(&format!("Mods folder: {}", mods_root.display()));
+        append_mod_folder_rows(self, &self.widgets.package_list_box, mods_root, 0);
     }
 
     fn refresh_textures_list(&self) {
@@ -2309,7 +2440,10 @@ impl App {
             thread::spawn(move || {
                 let result = import_asset_draft(&tool_paths, &file, folder_id)
                     .map_err(|error| format!("{}", error));
-                let _ = tx.send(JobResult::ImportFinished(result));
+                let _ = tx.send(JobResult::ImportFinished {
+                    source_path: file,
+                    result,
+                });
             });
         }
 
@@ -2322,20 +2456,24 @@ impl App {
             self.set_status("Select a package first.");
             return;
         };
+        self.queue_save_asset_by_index(asset_index);
+    }
+
+    fn queue_save_asset_by_index(&mut self, asset_index: usize) {
         let Some(asset) = self.assets.get(asset_index) else {
             return;
         };
+        if !asset.dirty {
+            self.set_status("There are no unsaved changes for this file.");
+            return;
+        }
 
         let asset_id = asset.id.clone();
-        let output_path = self
-            .tool_paths
-            .builds_dir
-            .join(self.folder_path_buf(asset.folder_id))
-            .join(asset.source_path.file_name().unwrap_or_default());
         let tx = self.job_tx.clone();
         let tool_paths = self.tool_paths.clone();
         let source_path = asset.source_path.clone();
         let xml_path = asset.xml_path.clone();
+        let backup_before_save = self.config.backup_before_save;
         let archive_changes: Vec<_> = asset
             .archive_entries
             .iter()
@@ -2347,14 +2485,16 @@ impl App {
             .collect();
 
         self.pending_jobs += 1;
-        self.set_status(format!("Saving build for {}...", asset.title()));
+        self.set_status(format!("Applying changes to {}...", asset.title()));
 
         thread::spawn(move || {
-            let result = if let Some(xml_path) = xml_path {
-                save_asset_build_job(&tool_paths, &xml_path, &output_path)
-            } else {
-                save_rpf_build_job(&tool_paths, &source_path, &output_path, archive_changes)
-            }
+            let result = save_asset_in_place_job(
+                &tool_paths,
+                &source_path,
+                xml_path.as_deref(),
+                archive_changes,
+                backup_before_save,
+            )
             .map_err(|error| format!("{}", error));
             let _ = tx.send(JobResult::SaveFinished { asset_id, result });
         });
@@ -2569,6 +2709,11 @@ impl App {
     }
 }
 
+fn sync_settings_panel_visibility(widgets: &AppWidgets, reveal: bool) {
+    widgets.settings_backdrop.set_visible(reveal);
+    widgets.settings_revealer.set_reveal_child(reveal);
+}
+
 thread_local! {
     static APP: RefCell<Option<Weak<RefCell<App>>>> = const { RefCell::new(None) };
 }
@@ -2580,6 +2725,21 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
 
     let widgets = &app.borrow().widgets;
 
+    {
+        let settings_backdrop = widgets.settings_backdrop.clone();
+        let settings_revealer = widgets.settings_revealer.clone();
+        widgets.app_menu_button.connect_toggled(move |button| {
+            let reveal = button.is_active();
+            settings_backdrop.set_visible(reveal);
+            settings_revealer.set_reveal_child(reveal);
+        });
+    }
+    {
+        let app_menu_button = widgets.app_menu_button.clone();
+        widgets.settings_backdrop.connect_clicked(move |_| {
+            app_menu_button.set_active(false);
+        });
+    }
     {
         let app = Rc::clone(app);
         widgets.rerun_setup_button.connect_clicked(move |_| {
@@ -2610,8 +2770,33 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::clone(app);
+        widgets.change_mod_folder_button.connect_clicked(move |_| {
+            present_mod_folder_dialog(&app);
+        });
+    }
+    {
+        let app = Rc::clone(app);
+        widgets.open_mod_folder_button.connect_clicked(move |_| {
+            app.borrow_mut().open_mods_root_folder();
+        });
+    }
+    {
+        let app = Rc::clone(app);
+        widgets
+            .backup_before_save_check
+            .connect_toggled(move |check| {
+                let mut app = app.borrow_mut();
+                let active = check.is_active();
+                if app.config.backup_before_save != active {
+                    app.config.backup_before_save = active;
+                    app.persist_config();
+                }
+            });
+    }
+    {
+        let app = Rc::clone(app);
         widgets.import_button.connect_clicked(move |_| {
-            present_asset_file_dialog(&app);
+            present_mod_folder_dialog(&app);
         });
     }
     {
@@ -2657,9 +2842,9 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
         });
     }
     {
-        let app = Rc::clone(app);
+        let app_menu_button = widgets.app_menu_button.clone();
         widgets.settings_button.connect_clicked(move |_| {
-            app.borrow().widgets.copy_destination_window.present();
+            app_menu_button.set_active(true);
         });
     }
     {
@@ -2775,16 +2960,10 @@ fn build_widgets(
     title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     header_bar.set_title_widget(Some(&title_label));
 
-    let app_menu_button = gtk::MenuButton::builder()
+    let app_menu_button = gtk::ToggleButton::builder()
         .icon_name("open-menu-symbolic")
-        .tooltip_text("Application menu")
+        .tooltip_text("Settings")
         .build();
-    let app_menu_popover = gtk::Popover::new();
-    let app_menu_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    app_menu_box.set_margin_top(10);
-    app_menu_box.set_margin_bottom(10);
-    app_menu_box.set_margin_start(10);
-    app_menu_box.set_margin_end(10);
     let rerun_setup_button = gtk::Button::with_label("Run Setup Wizard Again");
     let check_updates_button = gtk::Button::with_label("Check External Tool Updates");
     let theme_label = gtk::Label::new(Some("Theme"));
@@ -2799,12 +2978,6 @@ fn build_widgets(
         ThemePreference::Light => 1,
         ThemePreference::Dark => 2,
     });
-    app_menu_box.append(&rerun_setup_button);
-    app_menu_box.append(&check_updates_button);
-    app_menu_box.append(&theme_label);
-    app_menu_box.append(&theme_dropdown);
-    app_menu_popover.set_child(Some(&app_menu_box));
-    app_menu_button.set_popover(Some(&app_menu_popover));
     header_bar.pack_start(&app_menu_button);
 
     let back_button = gtk::Button::from_icon_name("go-previous-symbolic");
@@ -2814,26 +2987,11 @@ fn build_widgets(
     let import_button = gtk::Button::from_icon_name("document-open-symbolic");
     import_button.set_tooltip_text(Some("Import files"));
     let save_button = gtk::Button::from_icon_name("document-save-symbolic");
-    save_button.set_tooltip_text(Some("Save build"));
+    save_button.set_tooltip_text(Some("Save changes"));
     let open_build_folder_button = gtk::Button::with_label("Open Build Folder");
     let copy_all_button = gtk::Button::with_label("Copy All");
     let settings_button = gtk::Button::with_label("Settings");
-    let more_button = gtk::MenuButton::builder()
-        .icon_name("open-menu-symbolic")
-        .tooltip_text("More actions")
-        .build();
-    let more_menu = gtk::Popover::new();
-    let more_menu_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    more_menu_box.set_margin_top(8);
-    more_menu_box.set_margin_bottom(8);
-    more_menu_box.set_margin_start(8);
-    more_menu_box.set_margin_end(8);
-    more_menu_box.append(&open_build_folder_button);
-    more_menu_box.append(&settings_button);
-    more_menu.set_child(Some(&more_menu_box));
-    more_button.set_popover(Some(&more_menu));
 
-    header_bar.pack_end(&more_button);
     header_bar.pack_end(&copy_all_button);
     header_bar.pack_end(&save_button);
     header_bar.pack_end(&import_button);
@@ -2886,8 +3044,17 @@ fn build_widgets(
     status_label.set_margin_start(12);
     status_label.set_margin_end(12);
     status_label.add_css_class("caption");
+    let status_button = gtk::Button::new();
+    status_button.add_css_class("flat");
+    status_button.set_halign(gtk::Align::Fill);
+    status_button.set_hexpand(true);
+    status_button.set_tooltip_text(Some("Click to copy the current status"));
+    status_button.set_child(Some(&status_label));
 
     let browser_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let browser_overlay = gtk::Overlay::new();
+    browser_overlay.set_hexpand(true);
+    browser_overlay.set_vexpand(true);
     let main_paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     main_paned.set_wide_handle(true);
     main_paned.set_position(360);
@@ -2900,9 +3067,79 @@ fn build_widgets(
     right_paned.set_shrink_start_child(false);
     right_paned.set_shrink_end_child(false);
 
-    let packages_panel = build_panel_box("Packages");
+    let settings_revealer = gtk::Revealer::new();
+    settings_revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+    settings_revealer.set_reveal_child(false);
+    settings_revealer.set_halign(gtk::Align::Start);
+    settings_revealer.set_valign(gtk::Align::Fill);
+    settings_revealer.set_vexpand(true);
+    let settings_backdrop = gtk::Button::new();
+    settings_backdrop.set_visible(false);
+    settings_backdrop.set_can_focus(false);
+    settings_backdrop.set_halign(gtk::Align::Fill);
+    settings_backdrop.set_valign(gtk::Align::Fill);
+    settings_backdrop.set_hexpand(true);
+    settings_backdrop.set_vexpand(true);
+    settings_backdrop.add_css_class("flat");
+    settings_backdrop.add_css_class("background");
+    settings_backdrop.set_opacity(0.35);
+    let settings_panel = build_panel_box("Settings");
+    settings_panel.set_size_request(320, -1);
+    let mod_folder_label = gtk::Label::new(Some("GTA V mods folder"));
+    mod_folder_label.set_xalign(0.0);
+    let mod_folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let mod_folder_path_label = gtk::Label::new(Some("Not configured"));
+    mod_folder_path_label.set_xalign(0.0);
+    mod_folder_path_label.set_hexpand(true);
+    mod_folder_path_label.set_wrap(true);
+    mod_folder_path_label.add_css_class("caption");
+    let open_mod_folder_button = gtk::Button::from_icon_name("folder-open-symbolic");
+    open_mod_folder_button.add_css_class("flat");
+    open_mod_folder_button.set_tooltip_text(Some("Open GTA V mods folder"));
+    open_mod_folder_button.set_valign(gtk::Align::Start);
+    let change_mod_folder_button = gtk::Button::with_label("Choose Mods Folder");
+    mod_folder_row.append(&mod_folder_path_label);
+    mod_folder_row.append(&open_mod_folder_button);
+    let backup_before_save_check =
+        gtk::CheckButton::with_label("Create backup before saving changes");
+    backup_before_save_check.set_active(config.backup_before_save);
+    let destination_label = gtk::Label::new(Some("Copy all destination"));
+    destination_label.set_xalign(0.0);
+    let destination_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let copy_destination_entry = gtk::Entry::new();
+    copy_destination_entry.set_hexpand(true);
+    let browse_copy_destination_button = gtk::Button::with_label("Browse");
+    let copy_hint = gtk::Label::new(Some(
+        "Optional: use Copy All to mirror built files somewhere else while preserving relative structure.",
+    ));
+    copy_hint.set_wrap(true);
+    copy_hint.set_xalign(0.0);
+    copy_hint.add_css_class("caption");
+    destination_controls.append(&copy_destination_entry);
+    destination_controls.append(&browse_copy_destination_button);
+    settings_panel.append(&rerun_setup_button);
+    settings_panel.append(&check_updates_button);
+    settings_panel.append(&theme_label);
+    settings_panel.append(&theme_dropdown);
+    settings_panel.append(&mod_folder_label);
+    settings_panel.append(&mod_folder_row);
+    settings_panel.append(&change_mod_folder_button);
+    settings_panel.append(&backup_before_save_check);
+    settings_panel.append(&destination_label);
+    settings_panel.append(&destination_controls);
+    settings_panel.append(&copy_hint);
+    let settings_shell = gtk::Frame::new(None);
+    settings_shell.set_size_request(340, -1);
+    settings_shell.set_hexpand(false);
+    settings_shell.set_vexpand(true);
+    settings_shell.add_css_class("background");
+    settings_shell.add_css_class("view");
+    settings_shell.set_child(Some(&settings_panel));
+    settings_revealer.set_child(Some(&settings_shell));
+
+    let packages_panel = build_panel_box("Mod Files");
     packages_panel.set_size_request(320, -1);
-    let package_target_label = gtk::Label::new(Some("Target folder: Workspace"));
+    let package_target_label = gtk::Label::new(Some("GTA V mods folder not configured"));
     package_target_label.set_xalign(0.0);
     package_target_label.set_wrap(true);
     package_target_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
@@ -2930,9 +3167,13 @@ fn build_widgets(
         .child(&package_list_box)
         .build();
 
+    new_folder_entry.set_visible(false);
+    create_folder_button.set_visible(false);
+    import_here_button.set_visible(false);
+    move_here_button.set_visible(false);
+    folder_controls.set_visible(false);
+    action_controls.set_visible(false);
     packages_panel.append(&package_target_label);
-    packages_panel.append(&folder_controls);
-    packages_panel.append(&action_controls);
     packages_panel.append(&package_scroll);
 
     let textures_panel = build_panel_box("Textures");
@@ -3000,7 +3241,10 @@ fn build_widgets(
     main_paned.set_end_child(Some(&right_paned));
     right_paned.set_start_child(Some(&textures_panel));
     right_paned.set_end_child(Some(&preview_panel));
-    browser_page.append(&main_paned);
+    browser_overlay.set_child(Some(&main_paned));
+    browser_overlay.add_overlay(&settings_backdrop);
+    browser_overlay.add_overlay(&settings_revealer);
+    browser_page.append(&browser_overlay);
 
     let editor_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
     editor_page.set_margin_top(12);
@@ -3051,55 +3295,48 @@ fn build_widgets(
     stack.add_named(&editor_page, Some("editor"));
     stack.set_visible_child_name("setup");
 
-    let copy_destination_window = gtk::Window::builder()
-        .title("Settings")
-        .transient_for(&window)
-        .modal(true)
-        .default_width(560)
-        .default_height(180)
-        .build();
-    let settings_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    settings_box.set_margin_top(16);
-    settings_box.set_margin_bottom(16);
-    settings_box.set_margin_start(16);
-    settings_box.set_margin_end(16);
-    let destination_label = gtk::Label::new(Some("Copy all destination"));
-    destination_label.set_xalign(0.0);
-    let destination_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let copy_destination_entry = gtk::Entry::new();
-    copy_destination_entry.set_hexpand(true);
-    let browse_copy_destination_button = gtk::Button::with_label("Browse");
-    let copy_hint = gtk::Label::new(Some(
-        "Use the top-bar Copy All button to copy every built file into this destination while keeping the fake folder structure.",
-    ));
-    copy_hint.set_wrap(true);
-    copy_hint.set_xalign(0.0);
-    copy_hint.add_css_class("caption");
-
-    destination_controls.append(&copy_destination_entry);
-    destination_controls.append(&browse_copy_destination_button);
-    settings_box.append(&destination_label);
-    settings_box.append(&destination_controls);
-    settings_box.append(&copy_hint);
-    copy_destination_window.set_child(Some(&settings_box));
+    let copy_destination_window: gtk::Window = window.clone().upcast();
 
     root.append(&stack);
-    root.append(&status_label);
+    root.append(&status_button);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header_bar);
     toolbar_view.set_content(Some(&root));
-    window.set_content(Some(&toolbar_view));
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&toolbar_view));
+    window.set_content(Some(&toast_overlay));
+
+    {
+        let status_label = status_label.clone();
+        let toast_overlay = toast_overlay.clone();
+        status_button.connect_clicked(move |button| {
+            let text = status_label.text().trim().to_owned();
+            if text.is_empty() {
+                return;
+            }
+
+            button.clipboard().set_text(&text);
+            toast_overlay.add_toast(adw::Toast::new("Copied status text."));
+        });
+    }
 
     let copy_destination_default = tool_paths.builds_dir.display().to_string();
     copy_destination_entry.set_text(&copy_destination_default);
 
     AppWidgets {
         window,
+        toast_overlay,
         app_menu_button,
+        settings_backdrop,
+        settings_revealer,
         rerun_setup_button,
         check_updates_button,
         theme_dropdown,
+        mod_folder_path_label,
+        open_mod_folder_button,
+        change_mod_folder_button,
+        backup_before_save_check,
         back_button,
         import_button,
         save_button,
@@ -3108,6 +3345,8 @@ fn build_widgets(
         settings_button,
         status_label,
         stack,
+        browser_main_paned: main_paned,
+        packages_panel,
         package_target_label,
         new_folder_entry,
         create_folder_button,
@@ -3158,60 +3397,160 @@ fn build_panel_box(title: &str) -> gtk::Box {
     panel
 }
 
-fn append_folder_rows(app: &App, container: &gtk::Box, folder_id: u64, depth: i32) {
-    if folder_id == ROOT_FOLDER_ID {
-        let root_row = build_tree_button(
-            "Workspace",
-            depth,
-            app.selected_folder_id == ROOT_FOLDER_ID,
-            false,
-        );
-        root_row.connect_clicked(move |_| {
-            with_app(|app| {
-                app.selected_folder_id = ROOT_FOLDER_ID;
-                app.refresh_package_tree();
-            });
-        });
-        container.append(&root_row);
-    } else {
-        let row = build_tree_button(
-            &app.folder_label(folder_id),
-            depth,
-            app.selected_folder_id == folder_id,
-            true,
-        );
-        row.connect_clicked(move |_| {
-            with_app(|app| {
-                app.selected_folder_id = folder_id;
-                app.refresh_package_tree();
-            });
-        });
-        container.append(&row);
-    }
+fn append_mod_folder_rows(app: &App, container: &gtk::Box, directory: &Path, depth: i32) {
+    let Ok(entries) = read_mod_tree_entries(directory) else {
+        let error_label = gtk::Label::new(Some("Failed to read this folder."));
+        error_label.set_xalign(0.0);
+        error_label.add_css_class("caption");
+        error_label.set_margin_start((depth * 18).max(0));
+        container.append(&error_label);
+        return;
+    };
 
-    let next_depth = depth + 1;
-    for child_folder_id in app.child_folder_ids(folder_id) {
-        append_folder_rows(app, container, child_folder_id, next_depth);
-    }
-    for asset_index in app.asset_indices_in_folder(folder_id) {
-        let asset = &app.assets[asset_index];
-        let mut label = format!("{} [{}]", asset.title(), asset.kind.label());
-        if asset.dirty {
+    for path in entries {
+        if path.is_dir() {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row.set_margin_top(2);
+            row.set_margin_bottom(2);
+            row.set_margin_start((depth * 18).max(0));
+            row.set_margin_end(4);
+
+            let expanded = app.mod_tree_expanded_paths.contains(&path);
+            let toggle = gtk::Button::with_label(if expanded { "-" } else { "+" });
+            toggle.add_css_class("flat");
+            let folder_path = path.clone();
+            toggle.connect_clicked(move |_| {
+                with_app(|app| {
+                    app.toggle_mod_tree_path(&folder_path);
+                });
+            });
+
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let button = gtk::Button::with_label(&format!("[Folder] {}", label));
+            button.set_halign(gtk::Align::Fill);
+            button.set_hexpand(true);
+            let folder_path = path.clone();
+            button.connect_clicked(move |_| {
+                with_app(|app| {
+                    app.toggle_mod_tree_path(&folder_path);
+                });
+            });
+
+            row.append(&toggle);
+            row.append(&button);
+            container.append(&row);
+
+            if expanded {
+                append_mod_folder_rows(app, container, &path, depth + 1);
+            }
+            continue;
+        }
+
+        let Some(kind) = AssetKind::from_path(&path) else {
+            continue;
+        };
+
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.set_margin_top(2);
+        row.set_margin_bottom(2);
+        row.set_margin_start((depth * 18).max(0));
+        row.set_margin_end(4);
+
+        let asset_index = app.asset_index_for_source_path(&path);
+        let asset = asset_index.and_then(|index| app.assets.get(index));
+        let pending = app.pending_import_paths.contains(&path);
+        let selected = asset_index.is_some_and(|index| app.selected_asset == Some(index))
+            || app
+                .selected_mod_path
+                .as_ref()
+                .is_some_and(|selected_path| selected_path == &path);
+
+        let mut label = format!(
+            "{} [{}]",
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            kind.label()
+        );
+        if pending {
+            label.push_str(" (loading...)");
+        } else if asset.is_some_and(|asset| asset.dirty) {
             label.push_str(" *");
         }
-        let row = build_tree_button(
-            &label,
-            next_depth,
-            app.selected_asset == Some(asset_index),
-            false,
-        );
-        row.connect_clicked(move |_| {
+
+        let button = build_tree_button(&label, 0, selected, false);
+        button.set_margin_start(0);
+        let file_path = path.clone();
+        button.connect_clicked(move |_| {
             with_app(|app| {
-                app.select_asset(asset_index);
+                app.open_mod_asset_path(file_path.clone());
             });
         });
+
+        let save_button = gtk::Button::from_icon_name("document-save-symbolic");
+        save_button.add_css_class("flat");
+        save_button.set_tooltip_text(Some("Apply changes to this file"));
+        save_button.set_sensitive(asset.is_some_and(|asset| asset.dirty));
+        if asset.is_some_and(|asset| asset.dirty) {
+            save_button.add_css_class("suggested-action");
+        }
+        let file_path = path.clone();
+        save_button.connect_clicked(move |_| {
+            with_app(|app| {
+                if let Some(asset_index) = app.asset_index_for_source_path(&file_path) {
+                    app.queue_save_asset_by_index(asset_index);
+                } else {
+                    app.set_status("Open this file before applying changes.");
+                }
+            });
+        });
+
+        row.append(&button);
+        row.append(&save_button);
         container.append(&row);
     }
+}
+
+fn read_mod_tree_entries(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    let mut files = Vec::new();
+
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            directories.push(path);
+        } else if is_supported_mod_asset_path(&path) {
+            files.push(path);
+        }
+    }
+
+    directories.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+    files.sort_by_key(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+
+    directories.extend(files);
+    Ok(directories)
+}
+
+fn is_supported_mod_asset_path(path: &Path) -> bool {
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().ends_with(".bak"))
+    {
+        return false;
+    }
+
+    AssetKind::from_path(path).is_some()
 }
 
 fn build_tree_button(label: &str, depth: i32, selected: bool, folder: bool) -> gtk::Button {
@@ -3748,6 +4087,44 @@ fn present_copy_destination_dialog(app: &Rc<RefCell<App>>) {
     });
 }
 
+fn present_mod_folder_dialog(app: &Rc<RefCell<App>>) {
+    let app_borrow = app.borrow();
+    let dialog = gtk::FileDialog::builder()
+        .title("Choose GTA V mods folder")
+        .modal(true)
+        .build();
+
+    if let Some(dir) = app_borrow
+        .config
+        .mod_folder_path
+        .as_ref()
+        .filter(|dir| dir.exists())
+    {
+        dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
+    } else if let Some(dir) = app_borrow
+        .last_asset_dir
+        .as_ref()
+        .filter(|dir| dir.exists())
+    {
+        dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
+    }
+
+    let parent = app_borrow.widgets.window.clone();
+    drop(app_borrow);
+
+    let app_ref = Rc::clone(app);
+    dialog.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
+        if let Ok(file) = result {
+            if let Some(path) = file.path() {
+                let mut app = app_ref.borrow_mut();
+                app.last_asset_dir = Some(path.clone());
+                app.config.last_asset_dir = app.last_asset_dir.clone();
+                app.set_mod_folder_path(path);
+            }
+        }
+    });
+}
+
 fn texture_from_path(path: &Path) -> Result<gdk::Texture> {
     gdk::Texture::from_file(&gio::File::for_path(path)).map_err(|error| anyhow!(error.to_string()))
 }
@@ -4152,6 +4529,80 @@ fn save_rpf_build_job(
     let _ = fs::remove_file(&manifest_path);
     result?;
     Ok(output_path.to_path_buf())
+}
+
+fn save_asset_in_place_job(
+    tool_paths: &ToolPaths,
+    source_path: &Path,
+    xml_path: Option<&Path>,
+    changes: Vec<RpfBuildChange>,
+    backup_before_save: bool,
+) -> Result<PathBuf> {
+    let temp_output_path = temporary_save_path(source_path);
+    if let Some(parent) = temp_output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    if backup_before_save && source_path.is_file() {
+        let backup_path = backup_path_for(source_path)?;
+        fs::copy(source_path, &backup_path).with_context(|| {
+            format!(
+                "Failed to create backup {} from {}",
+                backup_path.display(),
+                source_path.display()
+            )
+        })?;
+    }
+
+    if let Some(xml_path) = xml_path {
+        save_asset_build_job(tool_paths, xml_path, &temp_output_path)?;
+    } else {
+        save_rpf_build_job(tool_paths, source_path, &temp_output_path, changes)?;
+    }
+
+    replace_file_from_temp(&temp_output_path, source_path)?;
+    Ok(source_path.to_path_buf())
+}
+
+fn backup_path_for(source_path: &Path) -> Result<PathBuf> {
+    let file_name = source_path
+        .file_name()
+        .context("Asset path does not contain a file name")?
+        .to_string_lossy();
+    Ok(source_path.with_file_name(format!("{}.bak", file_name)))
+}
+
+fn temporary_save_path(source_path: &Path) -> PathBuf {
+    let file_name = source_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("save_{}", unix_timestamp_ms()));
+    let temp_dir_name = format!(".gtav_texture_importer_tmp_{}", unix_timestamp_ms());
+    source_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(temp_dir_name)
+        .join(file_name)
+}
+
+fn replace_file_from_temp(temp_path: &Path, destination_path: &Path) -> Result<()> {
+    if let Err(error) = fs::rename(temp_path, destination_path) {
+        fs::copy(temp_path, destination_path).with_context(|| {
+            format!(
+                "Failed to replace {} with {} after rename error: {}",
+                destination_path.display(),
+                temp_path.display(),
+                error
+            )
+        })?;
+        let _ = fs::remove_file(temp_path);
+    }
+
+    if let Some(parent) = temp_path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+
+    Ok(())
 }
 
 fn copy_all_builds(copy_jobs: Vec<(PathBuf, PathBuf)>) -> Result<usize> {

@@ -14,20 +14,22 @@ The application currently has three major UI states managed through a stack.
 
 The editor is intentionally not an in-app popup.
 
-## Header / App Menu
+## Header / Settings Drawer
 
 The header bar contains:
 
-- app menu in the top-left
+- settings-drawer toggle in the top-left
 - back button when in editor or setup flow
-- import/save/copy actions
 - overflow menu for secondary actions
 
-The app menu currently exposes:
+The left settings drawer currently exposes:
 
 - `Run Setup Wizard Again`
 - `Check External Tool Updates`
 - `Theme`
+- GTA V mods folder path + chooser
+- backup-before-save toggle
+- copy-destination controls
 
 ## Browser Screen Layout
 
@@ -35,10 +37,10 @@ The browser screen is a 3-pane layout.
 
 ### Left pane: packages
 
-- fake folder tree
-- create folder
-- import files into current folder
-- move selected imported package into current folder
+- real filesystem tree rooted at the configured GTA V mods folder
+- empty-state prompt when the mods folder is not configured yet
+- save icon on supported file rows when there are unsaved changes
+- saves apply back to the original selected file instead of writing only to `builds/`
 
 ### Middle pane: textures / archive explorer
 
