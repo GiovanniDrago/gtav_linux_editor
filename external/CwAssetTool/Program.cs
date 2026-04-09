@@ -1,10 +1,12 @@
 using System.Text.Json;
+using System.Xml;
 using CodeWalker.GameFiles;
 using CodeWalker.Utils;
 
 var jsonOptions = new JsonSerializerOptions
 {
     PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    PropertyNameCaseInsensitive = true,
     WriteIndented = true,
 };
 
@@ -17,6 +19,8 @@ static int Usage()
     Console.Error.WriteLine("  cwassettool import <xml> <output-asset>");
     Console.Error.WriteLine("  cwassettool list-rpf <archive.rpf>");
     Console.Error.WriteLine("  cwassettool export-rpf-entry <archive.rpf> <entry-path> <output-dir>");
+    Console.Error.WriteLine("  cwassettool export-rpf-raw-entry <archive.rpf> <entry-path> <output-file>");
+    Console.Error.WriteLine("  cwassettool export-rpf-ymt-entry <archive.rpf> <entry-path> <output-dir>");
     Console.Error.WriteLine("  cwassettool build-rpf <source.rpf> <output.rpf> <changes.json>");
     return 1;
 }
@@ -67,6 +71,21 @@ static bool IsSupportedAssetExtension(string extension) => extension switch
 {
     ".ydr" or ".yft" or ".ytd" => true,
     _ => false,
+};
+
+static bool IsXmlTextExtension(string extension) => extension switch
+{
+    ".xml" or ".meta" => true,
+    _ => false,
+};
+
+static string GetContentKind(string extension) => extension switch
+{
+    ".rpf" => "package",
+    ".ymt" => "converted_xml",
+    _ when IsSupportedAssetExtension(extension) => "texture_asset",
+    _ when IsXmlTextExtension(extension) => "xml_text",
+    _ => "file",
 };
 
 static IEnumerable<Texture> EnumerateTextures(string assetPath)
@@ -277,6 +296,7 @@ static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile a
             childDirectory.Path,
             childDisplayPath,
             "folder",
+            "folder",
             false,
             BuildRpfChildren(childDirectory, archive, childDisplayPath)
         ));
@@ -296,12 +316,14 @@ static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile a
         }
         else
         {
+            var extension = (Path.GetExtension(childFileName) ?? string.Empty).ToLowerInvariant();
             children.Add(new RpfTreeNode(
                 childFileName,
                 childFilePath,
                 childDisplayPath,
                 "file",
-                IsSupportedAssetExtension((Path.GetExtension(childFileName) ?? string.Empty).ToLowerInvariant()),
+                GetContentKind(extension),
+                IsSupportedAssetExtension(extension),
                 new List<RpfTreeNode>()
             ));
         }
@@ -321,6 +343,7 @@ static RpfTreeNode BuildRpfNode(RpfFile archive, string displayPath)
         archive.Name ?? Path.GetFileName(archive.FilePath) ?? "(archive)",
         archive.Path ?? archive.FilePath ?? string.Empty,
         displayPath,
+        "package",
         "package",
         false,
         BuildRpfChildren(archive.Root, archive, displayPath)
@@ -353,6 +376,80 @@ static int ExportRpfEntry(string rpfPath, string entryPath, string outputDir)
     return 0;
 }
 
+static int ExportRpfRawEntry(string rpfPath, string entryPath, string outputPath)
+{
+    var root = LoadRpf(rpfPath);
+    var manager = CreateRpfManager(root);
+    var entry = manager.GetEntry(entryPath) as RpfFileEntry
+        ?? throw new InvalidOperationException($"RPF entry not found: {entryPath}");
+    var data = GetRpfEntryExportData(entry);
+    Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? Environment.CurrentDirectory);
+    File.WriteAllBytes(outputPath, data);
+    Console.WriteLine($"file={outputPath}");
+    return 0;
+}
+
+static string ExportYmtXml(RpfFileEntry entry, byte[] data, string outputDir)
+{
+    Directory.CreateDirectory(outputDir);
+    var ymt = new YmtFile(entry);
+    ymt.Load(data, entry);
+    var xml = MetaXml.GetXml(ymt, out var fileName);
+    if (string.IsNullOrWhiteSpace(xml) || string.IsNullOrWhiteSpace(fileName))
+    {
+        throw new InvalidOperationException($"Unable to convert {entry.Name} to editable XML.");
+    }
+
+    var xmlPath = Path.Combine(outputDir, fileName);
+    File.WriteAllText(xmlPath, xml);
+    return xmlPath;
+}
+
+static int ExportRpfYmtEntry(string rpfPath, string entryPath, string outputDir)
+{
+    var root = LoadRpf(rpfPath);
+    var manager = CreateRpfManager(root);
+    var entry = manager.GetEntry(entryPath) as RpfFileEntry
+        ?? throw new InvalidOperationException($"RPF entry not found: {entryPath}");
+    var ext = Path.GetExtension(entry.Name).ToLowerInvariant();
+    if (ext != ".ymt")
+    {
+        throw new InvalidOperationException($"Unsupported converted XML entry type: {ext}");
+    }
+
+    var data = entry.File.ExtractFile(entry)
+        ?? throw new InvalidOperationException($"Unable to extract archive entry: {entry.Path}");
+    var xmlPath = ExportYmtXml(entry, data, outputDir);
+    Console.WriteLine($"xml={xmlPath}");
+    return 0;
+}
+
+static MetaFormat InferYmtMetaFormat(string xmlPath)
+{
+    var name = Path.GetFileName(xmlPath).ToLowerInvariant();
+    if (name.EndsWith(".pso.xml", StringComparison.Ordinal))
+    {
+        return MetaFormat.PSO;
+    }
+    if (name.EndsWith(".rbf.xml", StringComparison.Ordinal))
+    {
+        return MetaFormat.RBF;
+    }
+    return MetaFormat.RSC;
+}
+
+static byte[] ImportYmtXmlBytes(string xmlPath)
+{
+    var doc = new XmlDocument();
+    doc.Load(xmlPath);
+    var data = XmlMeta.GetData(
+        doc,
+        InferYmtMetaFormat(xmlPath),
+        Path.GetDirectoryName(xmlPath) ?? Environment.CurrentDirectory
+    );
+    return data ?? throw new InvalidOperationException($"Unable to rebuild YMT from {xmlPath}");
+}
+
 static byte[] GetRpfEntryExportData(RpfFileEntry entry)
 {
     var data = entry.File.ExtractFile(entry)
@@ -367,6 +464,25 @@ static byte[] GetRpfEntryExportData(RpfFileEntry entry)
     return data;
 }
 
+static RpfDirectoryEntry GetRpfDirectoryEntry(RpfManager manager, string path)
+{
+    return manager.GetEntry(path) as RpfDirectoryEntry
+        ?? throw new InvalidOperationException($"RPF directory not found: {path}");
+}
+
+static byte[] GetBuildActionBytes(RpfBuildAction action, string extension)
+{
+    var sourcePath = action.SourcePath
+        ?? throw new InvalidOperationException($"Build action {action.Kind} is missing a source path.");
+
+    return action.Kind switch
+    {
+        "replace_asset_xml" => ImportAssetBytes(sourcePath, extension),
+        "replace_raw_file" or "add_raw_file" => File.ReadAllBytes(sourcePath),
+        _ => throw new InvalidOperationException($"Unsupported build action payload: {action.Kind}")
+    };
+}
+
 static int BuildRpf(string sourceRpfPath, string outputRpfPath, string manifestPath, JsonSerializerOptions options)
 {
     var manifest = JsonSerializer.Deserialize<RpfBuildManifest>(File.ReadAllText(manifestPath), options)
@@ -379,22 +495,72 @@ static int BuildRpf(string sourceRpfPath, string outputRpfPath, string manifestP
     }
     File.Copy(sourceRpfPath, outputRpfPath);
 
-    foreach (var change in manifest.Changes)
+    foreach (var action in manifest.Actions)
     {
         var root = LoadRpf(outputRpfPath);
         RpfFile.EnsureValidEncryption(root, _ => true, true);
         var manager = CreateRpfManager(root);
-        var entry = manager.GetEntry(change.EntryPath) as RpfFileEntry
-            ?? throw new InvalidOperationException($"RPF entry not found: {change.EntryPath}");
-
-        if (entry.Parent == null)
+        switch (action.Kind)
         {
-            throw new InvalidOperationException($"RPF entry has no parent directory: {change.EntryPath}");
-        }
+            case "replace_asset_xml":
+            case "replace_raw_file":
+            {
+                var entryPath = action.EntryPath
+                    ?? throw new InvalidOperationException($"Build action {action.Kind} is missing an entry path.");
+                var entry = manager.GetEntry(entryPath) as RpfFileEntry
+                    ?? throw new InvalidOperationException($"RPF entry not found: {entryPath}");
+                if (entry.Parent == null)
+                {
+                    throw new InvalidOperationException($"RPF entry has no parent directory: {entryPath}");
+                }
 
-        var ext = Path.GetExtension(entry.Name).ToLowerInvariant();
-        var data = ImportAssetBytes(change.XmlPath, ext);
-        RpfFile.CreateFile(entry.Parent, entry.Name, data);
+                var ext = Path.GetExtension(entry.Name).ToLowerInvariant();
+                var data = GetBuildActionBytes(action, ext);
+                RpfFile.CreateFile(entry.Parent, entry.Name, data);
+                break;
+            }
+            case "replace_ymt_xml":
+            {
+                var entryPath = action.EntryPath
+                    ?? throw new InvalidOperationException($"Build action {action.Kind} is missing an entry path.");
+                var sourcePath = action.SourcePath
+                    ?? throw new InvalidOperationException($"Build action {action.Kind} is missing a source path.");
+                var entry = manager.GetEntry(entryPath) as RpfFileEntry
+                    ?? throw new InvalidOperationException($"RPF entry not found: {entryPath}");
+                if (entry.Parent == null)
+                {
+                    throw new InvalidOperationException($"RPF entry has no parent directory: {entryPath}");
+                }
+
+                var data = ImportYmtXmlBytes(sourcePath);
+                RpfFile.CreateFile(entry.Parent, entry.Name, data);
+                break;
+            }
+            case "add_folder":
+            {
+                var parentPath = action.ParentPath
+                    ?? throw new InvalidOperationException("Folder add action is missing a parent path.");
+                var name = action.Name
+                    ?? throw new InvalidOperationException("Folder add action is missing a name.");
+                var parentDirectory = GetRpfDirectoryEntry(manager, parentPath);
+                RpfFile.CreateDirectory(parentDirectory, name);
+                break;
+            }
+            case "add_raw_file":
+            {
+                var parentPath = action.ParentPath
+                    ?? throw new InvalidOperationException("File add action is missing a parent path.");
+                var name = action.Name
+                    ?? throw new InvalidOperationException("File add action is missing a name.");
+                var parentDirectory = GetRpfDirectoryEntry(manager, parentPath);
+                var ext = Path.GetExtension(name).ToLowerInvariant();
+                var data = GetBuildActionBytes(action, ext);
+                RpfFile.CreateFile(parentDirectory, name, data);
+                break;
+            }
+            default:
+                throw new InvalidOperationException($"Unsupported build action: {action.Kind}");
+        }
     }
 
     Console.WriteLine($"asset={outputRpfPath}");
@@ -418,6 +584,8 @@ try
         "import" when args.Length == 3 => ImportAsset(FullPath(args[1]), FullPath(args[2])),
         "list-rpf" when args.Length == 2 => ListRpf(FullPath(args[1]), jsonOptions),
         "export-rpf-entry" when args.Length == 4 => ExportRpfEntry(FullPath(args[1]), args[2], FullPath(args[3])),
+        "export-rpf-raw-entry" when args.Length == 4 => ExportRpfRawEntry(FullPath(args[1]), args[2], FullPath(args[3])),
+        "export-rpf-ymt-entry" when args.Length == 4 => ExportRpfYmtEntry(FullPath(args[1]), args[2], FullPath(args[3])),
         "build-rpf" when args.Length == 4 => BuildRpf(FullPath(args[1]), FullPath(args[2]), FullPath(args[3]), jsonOptions),
         _ => Usage()
     };
@@ -433,13 +601,20 @@ record RpfTreeNode(
     string Path,
     string DisplayPath,
     string Kind,
+    string ContentKind,
     bool SupportedAsset,
     List<RpfTreeNode> Children
 );
 
-record RpfBuildManifest(List<RpfBuildChange> Changes);
+record RpfBuildManifest(List<RpfBuildAction> Actions);
 
-record RpfBuildChange(string EntryPath, string XmlPath);
+record RpfBuildAction(
+    string Kind,
+    string? EntryPath,
+    string? ParentPath,
+    string? Name,
+    string? SourcePath
+);
 
 static class KeyLoadState
 {
