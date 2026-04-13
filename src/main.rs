@@ -1,3 +1,8 @@
+mod config;
+mod filesystem;
+mod launcher;
+mod setup;
+
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,6 +22,10 @@ use gtk::glib;
 use image::{imageops::FilterType, DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use roxmltree::Document;
 use serde::{Deserialize, Serialize};
+
+use config::{AppConfig, ThemePreference, CURRENT_SETUP_REVISION};
+use filesystem::{missing_script_hook_files, set_directory_enabled, update_scripthook_ini};
+use setup::{SetupStatus, SetupStep};
 
 const APP_ID: &str = "lab.coding.gtav_texture_importer";
 const ROOT_FOLDER_ID: u64 = 0;
@@ -136,193 +145,6 @@ impl ToolPaths {
 
     fn codewalker_clone_url(&self) -> &'static str {
         "https://github.com/dexyfex/CodeWalker"
-    }
-}
-
-#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-enum ThemePreference {
-    System,
-    Light,
-    Dark,
-}
-
-impl ThemePreference {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-        }
-    }
-
-    fn color_scheme(self) -> adw::ColorScheme {
-        match self {
-            Self::System => adw::ColorScheme::Default,
-            Self::Light => adw::ColorScheme::ForceLight,
-            Self::Dark => adw::ColorScheme::ForceDark,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct AppConfig {
-    setup_complete: bool,
-    copy_destination: String,
-    theme: ThemePreference,
-    game_root_path: Option<PathBuf>,
-    backup_before_save: bool,
-    last_asset_dir: Option<PathBuf>,
-    last_image_dir: Option<PathBuf>,
-    last_copy_dir: Option<PathBuf>,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            setup_complete: false,
-            copy_destination: String::new(),
-            theme: ThemePreference::System,
-            game_root_path: None,
-            backup_before_save: true,
-            last_asset_dir: None,
-            last_image_dir: None,
-            last_copy_dir: None,
-        }
-    }
-}
-
-#[derive(Default, Deserialize)]
-struct AppConfigFile {
-    setup_complete: bool,
-    copy_destination: String,
-    theme: Option<ThemePreference>,
-    game_root_path: Option<PathBuf>,
-    mod_folder_path: Option<PathBuf>,
-    backup_before_save: Option<bool>,
-    last_asset_dir: Option<PathBuf>,
-    last_image_dir: Option<PathBuf>,
-    last_copy_dir: Option<PathBuf>,
-}
-
-impl From<AppConfigFile> for AppConfig {
-    fn from(value: AppConfigFile) -> Self {
-        let inferred_game_root = value.game_root_path.or_else(|| {
-            value.mod_folder_path.as_ref().and_then(|mod_folder_path| {
-                mod_folder_path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("mods"))
-                    .then(|| mod_folder_path.parent().map(Path::to_path_buf))
-                    .flatten()
-            })
-        });
-
-        Self {
-            setup_complete: value.setup_complete,
-            copy_destination: value.copy_destination,
-            theme: value.theme.unwrap_or(ThemePreference::System),
-            game_root_path: inferred_game_root,
-            backup_before_save: value.backup_before_save.unwrap_or(true),
-            last_asset_dir: value.last_asset_dir,
-            last_image_dir: value.last_image_dir,
-            last_copy_dir: value.last_copy_dir,
-        }
-    }
-}
-
-impl AppConfig {
-    fn path(tool_paths: &ToolPaths) -> PathBuf {
-        tool_paths.workspace_dir.join("config.json")
-    }
-
-    fn load(tool_paths: &ToolPaths) -> Self {
-        let path = Self::path(tool_paths);
-        fs::read_to_string(&path)
-            .ok()
-            .and_then(|content| serde_json::from_str::<AppConfigFile>(&content).ok())
-            .map(Into::into)
-            .unwrap_or_default()
-    }
-
-    fn save(&self, tool_paths: &ToolPaths) -> Result<()> {
-        fs::create_dir_all(&tool_paths.workspace_dir)?;
-        fs::write(Self::path(tool_paths), serde_json::to_string_pretty(self)?)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SetupStep {
-    Welcome,
-    ExternalTools,
-    SystemDependencies,
-    BuildHelper,
-    GameFolder,
-    Ready,
-}
-
-impl SetupStep {
-    fn next(self) -> Option<Self> {
-        match self {
-            Self::Welcome => Some(Self::ExternalTools),
-            Self::ExternalTools => Some(Self::SystemDependencies),
-            Self::SystemDependencies => Some(Self::BuildHelper),
-            Self::BuildHelper => Some(Self::GameFolder),
-            Self::GameFolder => Some(Self::Ready),
-            Self::Ready => None,
-        }
-    }
-
-    fn previous(self) -> Option<Self> {
-        match self {
-            Self::Welcome => None,
-            Self::ExternalTools => Some(Self::Welcome),
-            Self::SystemDependencies => Some(Self::ExternalTools),
-            Self::BuildHelper => Some(Self::SystemDependencies),
-            Self::GameFolder => Some(Self::BuildHelper),
-            Self::Ready => Some(Self::GameFolder),
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::Welcome => "Welcome",
-            Self::ExternalTools => "External Tools",
-            Self::SystemDependencies => "System Dependencies",
-            Self::BuildHelper => "Build Helper",
-            Self::GameFolder => "Game Folder",
-            Self::Ready => "Ready",
-        }
-    }
-}
-
-struct SetupStatus {
-    cwassettool_source: bool,
-    codewalker_source: bool,
-    cwassettool_binary: bool,
-    git_available: bool,
-    dotnet_available: bool,
-    magick_available: bool,
-}
-
-impl SetupStatus {
-    fn detect(tool_paths: &ToolPaths) -> Self {
-        Self {
-            cwassettool_source: tool_paths.cwassettool_present(),
-            codewalker_source: tool_paths.codewalker_present(),
-            cwassettool_binary: tool_paths.cwassettool_bin.is_file(),
-            git_available: tool_paths.ensure_git().is_ok(),
-            dotnet_available: tool_paths.ensure_dotnet().is_ok(),
-            magick_available: tool_paths.ensure_magick().is_ok(),
-        }
-    }
-
-    fn setup_ready(&self) -> bool {
-        self.cwassettool_source
-            && self.codewalker_source
-            && self.cwassettool_binary
-            && self.git_available
-            && self.dotnet_available
-            && self.magick_available
     }
 }
 
@@ -1125,6 +947,7 @@ enum JobResult {
         texture_index: usize,
         result: std::result::Result<(), String>,
     },
+    LaunchFinished(std::result::Result<String, String>),
     CopyAllFinished(std::result::Result<usize, String>),
 }
 
@@ -1149,6 +972,13 @@ struct AppWidgets {
     settings_button: gtk::Button,
     status_label: gtk::Label,
     stack: gtk::Stack,
+    dashboard_play_button: gtk::Button,
+    dashboard_editor_button: gtk::Button,
+    dashboard_launch_settings_button: gtk::Button,
+    dashboard_launch_settings_revealer: gtk::Revealer,
+    dashboard_addons_toggle: gtk::Switch,
+    dashboard_scripts_toggle: gtk::Switch,
+    dashboard_notice_label: gtk::Label,
     browser_main_paned: gtk::Paned,
     packages_panel: gtk::Box,
     package_target_label: gtk::Label,
@@ -1233,6 +1063,11 @@ impl App {
         if config.copy_destination.is_empty() {
             config.copy_destination = tool_paths.builds_dir.display().to_string();
         }
+        let initial_status = if config.game_root_path.is_some() {
+            "Ready.".to_owned()
+        } else {
+            "Ready. Choose the GTA V Linux game folder to begin.".to_owned()
+        };
         let (job_tx, job_rx) = mpsc::channel();
         let widgets = build_widgets(application, &tool_paths, &config);
         apply_theme(config.theme);
@@ -1259,7 +1094,7 @@ impl App {
             last_image_dir: None,
             last_copy_dir: None,
             pending_jobs: 0,
-            status: "Ready. Choose the GTA V game folder to begin.".to_owned(),
+            status: initial_status,
             job_tx,
             job_rx,
             widgets,
@@ -1270,8 +1105,8 @@ impl App {
             borrowed.last_asset_dir = borrowed.config.last_asset_dir.clone();
             borrowed.last_image_dir = borrowed.config.last_image_dir.clone();
             borrowed.last_copy_dir = borrowed.config.last_copy_dir.clone();
+            let _ = borrowed.apply_addon_script_settings();
             if let Some(path) = borrowed.mods_root_path() {
-                let _ = fs::create_dir_all(&path);
                 borrowed.mod_tree_expanded_paths.insert(path);
             }
         }
@@ -1280,7 +1115,10 @@ impl App {
         attach_job_poller(&app);
         app.borrow_mut().refresh_all();
         if !app.borrow().setup_required() {
-            app.borrow().widgets.stack.set_visible_child_name("browser");
+            app.borrow()
+                .widgets
+                .stack
+                .set_visible_child_name("dashboard");
         }
         app.borrow().widgets.window.present();
         Ok(app)
@@ -1291,6 +1129,7 @@ impl App {
         self.refresh_header();
         self.refresh_status();
         self.refresh_setup_page();
+        self.refresh_dashboard_page();
         self.refresh_package_tree();
         self.refresh_textures_list();
         self.refresh_preview_pane();
@@ -1298,9 +1137,7 @@ impl App {
     }
 
     fn setup_required(&self) -> bool {
-        !self.config.setup_complete
-            || !self.setup_status.setup_ready()
-            || self.game_root_path().is_none()
+        self.should_open_setup_on_start()
     }
 
     fn persist_config(&self) {
@@ -1322,46 +1159,149 @@ impl App {
             .filter(|path| path.is_dir())
     }
 
-    fn mods_root_path(&self) -> Option<PathBuf> {
+    fn derived_mods_root_path(&self) -> Option<PathBuf> {
         self.game_root_path().map(|path| path.join("mods"))
+    }
+
+    fn hidden_mods_root_path(&self) -> Option<PathBuf> {
+        self.game_root_path()
+            .map(|path| path.join(".mods.disabled"))
+    }
+
+    fn derived_scripts_root_path(&self) -> Option<PathBuf> {
+        self.game_root_path().map(|path| path.join("scripts"))
+    }
+
+    fn hidden_scripts_root_path(&self) -> Option<PathBuf> {
+        self.game_root_path()
+            .map(|path| path.join(".scripts.disabled"))
+    }
+
+    fn mods_root_path(&self) -> Option<PathBuf> {
+        self.config
+            .addons_enabled
+            .then(|| self.derived_mods_root_path())
+            .flatten()
+    }
+
+    fn scripthook_ini_path(&self) -> Option<PathBuf> {
+        self.game_root_path()
+            .map(|path| path.join("ScriptHookVDotNet.ini"))
+    }
+
+    fn editor_available(&self) -> bool {
+        self.game_root_path().is_some() && self.config.addons_enabled
+    }
+
+    fn current_page_name(&self) -> Option<String> {
+        self.widgets
+            .stack
+            .visible_child_name()
+            .map(|name| name.to_string())
+    }
+
+    fn show_dashboard(&self) {
+        self.widgets.stack.set_visible_child_name("dashboard");
+    }
+
+    fn show_browser(&self) {
+        self.widgets.stack.set_visible_child_name("browser");
+    }
+
+    fn open_editor_browser(&mut self) {
+        if !self.editor_available() {
+            self.set_status("Enable addons to use the editor.");
+            self.show_dashboard();
+            return;
+        }
+
+        self.show_browser();
+        self.refresh_all();
+    }
+
+    fn open_dashboard(&mut self) {
+        self.editor = None;
+        self.text_editor = None;
+        self.show_dashboard();
+        self.refresh_all();
+    }
+
+    fn queue_launch_game(&mut self) {
+        let Some(game_root) = self.game_root_path().map(Path::to_path_buf) else {
+            self.set_status("Choose the GTA V Linux game folder first.");
+            return;
+        };
+
+        self.pending_jobs += 1;
+        self.set_status("Preparing GTA V launch environment...");
+        let tx = self.job_tx.clone();
+        let workspace_dir = self.tool_paths.workspace_dir.clone();
+
+        thread::spawn(move || {
+            let result = (|| -> Result<String> {
+                let prepare = launcher::prepare_environment(&workspace_dir)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                let dependency_status =
+                    launcher::ensure_runtime_dependencies(&workspace_dir, &prepare)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                launcher::launch_game_prepared(&game_root, &prepare)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok(format!(
+                    "Started GTA V (runtime dependencies {}).",
+                    dependency_status.as_label()
+                ))
+            })()
+            .map_err(|error| format!("{error:#}"));
+
+            let _ = tx.send(JobResult::LaunchFinished(result));
+        });
+    }
+
+    fn should_open_setup_on_start(&self) -> bool {
+        self.config.setup_revision < CURRENT_SETUP_REVISION
+            || !self.config.setup_complete
+            || !self.setup_status.setup_ready()
+            || self.game_root_path().is_none()
     }
 
     fn set_game_root_path(&mut self, path: PathBuf) {
         let (game_root, selected_mods_folder) = normalize_selected_game_root(&path);
-        if !is_valid_game_root(&game_root) {
+        if launcher::validate_game_directory(&game_root).is_err() {
             self.set_status(format!(
-                "{} does not look like a GTA V game folder.",
+                "{} does not look like a GTA V Linux game folder.",
                 path.display()
-            ));
-            return;
-        }
-
-        let mods_path = game_root.join("mods");
-        if let Err(error) = fs::create_dir_all(&mods_path) {
-            self.set_status(format!(
-                "Failed to create mods folder at {}: {error}",
-                mods_path.display()
             ));
             return;
         }
 
         self.config.game_root_path = Some(game_root.clone());
         self.mod_tree_expanded_paths.clear();
-        self.mod_tree_expanded_paths.insert(mods_path.clone());
         self.selected_mod_path = None;
-        self.current_mod_browser_path = Some(mods_path.clone());
         self.pending_import_paths.clear();
         self.assets.clear();
         self.selected_asset = None;
         self.selected_texture = None;
         self.editor = None;
         self.text_editor = None;
+        if let Err(error) = self.apply_addon_script_settings() {
+            self.set_status(format!("Failed to prepare game folders: {error:#}"));
+            return;
+        }
+        if let Some(mods_path) = self.mods_root_path() {
+            self.mod_tree_expanded_paths.insert(mods_path.clone());
+            self.current_mod_browser_path = Some(mods_path.clone());
+        } else {
+            self.current_mod_browser_path = None;
+        }
         self.close_settings_panel();
         self.persist_config();
         self.set_status(format!(
             "Using GTA V game folder at {} and mods folder at {}",
             game_root.display(),
-            mods_path.display()
+            self.derived_mods_root_path()
+                .as_deref()
+                .unwrap_or_else(|| Path::new("mods"))
+                .display()
         ));
         if selected_mods_folder {
             self.show_toast("Using the parent GTA V game folder and its mods subfolder.");
@@ -1377,7 +1317,11 @@ impl App {
     }
 
     fn open_mods_root_folder(&mut self) {
-        let Some(directory) = self.mods_root_path() else {
+        let Some(directory) = self
+            .mods_root_path()
+            .or_else(|| self.hidden_mods_root_path())
+            .or_else(|| self.derived_mods_root_path())
+        else {
             self.set_status("Choose a GTA V game folder first.");
             return;
         };
@@ -1385,6 +1329,92 @@ impl App {
         if let Err(error) = open_directory(&directory) {
             self.set_status(format!("Failed to open folder: {error:#}"));
         }
+    }
+
+    fn set_addons_enabled(&mut self, enabled: bool) {
+        self.config.addons_enabled = enabled;
+        if let Err(error) = self.apply_addon_script_settings() {
+            self.set_status(format!("Failed to update addons: {error:#}"));
+            return;
+        }
+        self.persist_config();
+        self.refresh_all();
+    }
+
+    fn set_script_mods_enabled(&mut self, enabled: bool) {
+        self.config.script_mods_enabled = enabled;
+        if let Err(error) = self.apply_addon_script_settings() {
+            self.set_status(format!("Failed to update script mods: {error:#}"));
+            return;
+        }
+        self.persist_config();
+        self.refresh_all();
+    }
+
+    fn apply_addon_script_settings(&mut self) -> Result<()> {
+        let Some(game_root) = self.game_root_path().map(Path::to_path_buf) else {
+            return Ok(());
+        };
+
+        let mods_path = self
+            .derived_mods_root_path()
+            .unwrap_or_else(|| game_root.join("mods"));
+        let hidden_mods_path = self
+            .hidden_mods_root_path()
+            .unwrap_or_else(|| game_root.join(".mods.disabled"));
+        let scripts_path = self
+            .derived_scripts_root_path()
+            .unwrap_or_else(|| game_root.join("scripts"));
+        let hidden_scripts_path = self
+            .hidden_scripts_root_path()
+            .unwrap_or_else(|| game_root.join(".scripts.disabled"));
+
+        set_directory_enabled(&mods_path, &hidden_mods_path, self.config.addons_enabled)?;
+        set_directory_enabled(
+            &scripts_path,
+            &hidden_scripts_path,
+            self.config.script_mods_enabled,
+        )?;
+
+        let missing_files = missing_script_hook_files(&game_root);
+        let script_hook_ready = missing_files.is_empty();
+
+        let scripthook_ini = self
+            .scripthook_ini_path()
+            .unwrap_or_else(|| game_root.join("ScriptHookVDotNet.ini"));
+
+        if self.config.addons_enabled || self.config.script_mods_enabled {
+            if script_hook_ready {
+                update_scripthook_ini(&scripthook_ini, true)?;
+            } else {
+                self.status = format!("ScriptHook files are missing: {}", missing_files.join(", "));
+            }
+        } else if scripthook_ini.exists() {
+            update_scripthook_ini(&scripthook_ini, false)?;
+        }
+
+        if !self.config.addons_enabled {
+            self.assets.clear();
+            self.selected_asset = None;
+            self.selected_texture = None;
+            self.editor = None;
+            self.text_editor = None;
+            self.selected_mod_path = None;
+            self.current_mod_browser_path = None;
+            if matches!(
+                self.current_page_name().as_deref(),
+                Some("browser") | Some("editor")
+            ) {
+                self.show_dashboard();
+            }
+        } else if let Some(mods_path) = self.mods_root_path() {
+            self.mod_tree_expanded_paths.insert(mods_path.clone());
+            if self.current_mod_browser_path.is_none() {
+                self.current_mod_browser_path = Some(mods_path);
+            }
+        }
+
+        Ok(())
     }
 
     fn in_editor(&self) -> bool {
@@ -1421,16 +1451,28 @@ impl App {
     fn refresh_header(&self) {
         let in_editor = self.in_editor();
         let setup_required = self.setup_required();
+        let current_page = self.current_page_name();
+        let on_browser = current_page.as_deref() == Some("browser");
 
+        self.widgets.back_button.set_visible(
+            in_editor || matches!(current_page.as_deref(), Some("browser") | Some("setup")),
+        );
         self.widgets
-            .back_button
-            .set_visible(in_editor || setup_required);
-        self.widgets.app_menu_button.set_sensitive(!in_editor);
-        let mod_folder_text = match (self.game_root_path(), self.mods_root_path()) {
-            (Some(game_root), Some(mods_root)) => format!(
-                "Game: {}\nMods: {}",
+            .app_menu_button
+            .set_sensitive(!in_editor && on_browser);
+        if !on_browser {
+            self.widgets.app_menu_button.set_active(false);
+        }
+        let mod_folder_text = match (
+            self.game_root_path(),
+            self.derived_mods_root_path(),
+            self.derived_scripts_root_path(),
+        ) {
+            (Some(game_root), Some(mods_root), Some(scripts_root)) => format!(
+                "Game: {}\nMods: {}\nScripts: {}",
                 game_root.display(),
-                mods_root.display()
+                mods_root.display(),
+                scripts_root.display()
             ),
             _ => "Not configured".to_owned(),
         };
@@ -1439,21 +1481,23 @@ impl App {
             .set_text(&mod_folder_text);
         self.widgets
             .open_mod_folder_button
-            .set_sensitive(self.mods_root_path().is_some());
+            .set_sensitive(self.derived_mods_root_path().is_some());
         self.widgets
             .backup_before_save_check
             .set_active(self.config.backup_before_save);
-        self.widgets.save_button.set_visible(false);
-        self.widgets.open_build_folder_button.set_visible(false);
-        self.widgets.copy_all_button.set_visible(false);
-        self.widgets.import_button.set_visible(false);
-        self.widgets.settings_button.set_visible(false);
+        self.widgets.save_button.set_visible(on_browser);
+        self.widgets
+            .open_build_folder_button
+            .set_visible(on_browser);
+        self.widgets.copy_all_button.set_visible(on_browser);
+        self.widgets.import_button.set_visible(on_browser);
+        self.widgets.settings_button.set_visible(on_browser);
         self.widgets
             .edit_button
             .set_label(self.current_edit_button_label());
-        self.widgets
-            .edit_button
-            .set_sensitive(!in_editor && !setup_required && self.current_entry_editable());
+        self.widgets.edit_button.set_sensitive(
+            on_browser && !in_editor && !setup_required && self.current_entry_editable(),
+        );
         self.widgets.editor_apply_button.set_sensitive(
             !setup_required
                 && self.editor.as_ref().is_some_and(|editor| {
@@ -1487,6 +1531,10 @@ impl App {
                     self.setup_status.git_available
                         && self.setup_status.dotnet_available
                         && self.setup_status.magick_available
+                        && self.setup_status.wine_available
+                        && self.setup_status.wineboot_available
+                        && self.setup_status.wineserver_available
+                        && self.setup_status.winetricks_available
                 }
                 SetupStep::BuildHelper => self.setup_status.cwassettool_binary,
                 SetupStep::GameFolder => self.game_root_path().is_some(),
@@ -1500,7 +1548,9 @@ impl App {
                 SetupStep::SystemDependencies => false,
                 SetupStep::BuildHelper => !self.setup_status.cwassettool_binary,
                 SetupStep::GameFolder => true,
-                SetupStep::Ready => self.setup_status.setup_ready(),
+                SetupStep::Ready => {
+                    self.setup_status.setup_ready() && self.game_root_path().is_some()
+                }
             });
     }
 
@@ -1543,7 +1593,7 @@ impl App {
                 },
             ),
             SetupStep::SystemDependencies => (
-                "The app also needs git, dotnet, and ImageMagick available on the system. Install any missing dependency before continuing.",
+                "The app also needs git, dotnet, ImageMagick, and the Wine launcher tools available on the system. Install any missing dependency before continuing.",
                 None,
             ),
             SetupStep::BuildHelper => (
@@ -1619,6 +1669,26 @@ impl App {
                     self.setup_status.magick_available,
                     "Required for DDS preview generation and texture conversion",
                 ));
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "wine",
+                    self.setup_status.wine_available,
+                    "Required to launch the GTA V Linux variant",
+                ));
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "wineboot",
+                    self.setup_status.wineboot_available,
+                    "Required to initialize the Wine prefix",
+                ));
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "wineserver",
+                    self.setup_status.wineserver_available,
+                    "Required to wait for Wine prefix setup",
+                ));
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "winetricks",
+                    self.setup_status.winetricks_available,
+                    "Required to install the GTA runtime dependencies",
+                ));
             }
             SetupStep::BuildHelper => {
                 self.widgets.setup_list_box.append(&setup_status_row(
@@ -1656,6 +1726,56 @@ impl App {
                 ));
             }
         }
+    }
+
+    fn refresh_dashboard_page(&self) {
+        let page_name = self.current_page_name();
+        let on_dashboard = page_name.as_deref() == Some("dashboard");
+        self.widgets
+            .dashboard_launch_settings_button
+            .set_visible(on_dashboard && self.game_root_path().is_some());
+        self.widgets
+            .dashboard_play_button
+            .set_sensitive(!self.setup_required() && self.game_root_path().is_some());
+        self.widgets
+            .dashboard_editor_button
+            .set_sensitive(!self.setup_required() && self.editor_available());
+
+        if self.widgets.dashboard_addons_toggle.is_active() != self.config.addons_enabled {
+            self.widgets
+                .dashboard_addons_toggle
+                .set_active(self.config.addons_enabled);
+        }
+        if self.widgets.dashboard_scripts_toggle.is_active() != self.config.script_mods_enabled {
+            self.widgets
+                .dashboard_scripts_toggle
+                .set_active(self.config.script_mods_enabled);
+        }
+
+        let notice = if self.game_root_path().is_none() {
+            "Choose the GTA V Linux game folder in setup before launching or editing.".to_owned()
+        } else {
+            let missing_files =
+                missing_script_hook_files(self.game_root_path().expect("checked is_some above"));
+            let mut parts = Vec::new();
+            if !self.config.addons_enabled {
+                parts.push("Addons are disabled, so the editor is unavailable.".to_owned());
+            }
+            if (self.config.addons_enabled || self.config.script_mods_enabled)
+                && !missing_files.is_empty()
+            {
+                parts.push(format!(
+                    "ScriptHook files missing: {}",
+                    missing_files.join(", ")
+                ));
+            }
+            if parts.is_empty() {
+                "Game, addons, and editor are ready.".to_owned()
+            } else {
+                parts.join(" ")
+            }
+        };
+        self.widgets.dashboard_notice_label.set_text(&notice);
     }
 
     fn folder_path_components(&self, folder_id: u64) -> Vec<String> {
@@ -2489,6 +2609,15 @@ impl App {
                     }
                     self.refresh_all();
                 }
+                JobResult::LaunchFinished(result) => match result {
+                    Ok(message) => {
+                        self.set_status(message.clone());
+                        self.show_toast(message);
+                    }
+                    Err(error) => {
+                        self.set_status(format!("Launch failed: {error}"));
+                    }
+                },
                 JobResult::CopyAllFinished(result) => match result {
                     Ok(count) => self.set_status(format!("Copied {count} built file(s).")),
                     Err(error) => self.set_status(format!("Copy All failed: {error}")),
@@ -2501,6 +2630,32 @@ impl App {
 
     fn refresh_package_tree(&self) {
         clear_box(&self.widgets.package_list_box);
+
+        if self.game_root_path().is_some() && !self.config.addons_enabled {
+            self.widgets.packages_panel.set_size_request(250, -1);
+            self.widgets.browser_main_paned.set_position(250);
+            self.widgets
+                .import_to_mod_folder_button
+                .set_sensitive(false);
+            self.widgets.save_builds_button.set_sensitive(false);
+            self.widgets
+                .package_target_label
+                .set_text("Addons are disabled");
+            let empty_state = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            empty_state.set_margin_top(20);
+            empty_state.set_margin_bottom(12);
+            empty_state.set_margin_start(6);
+            empty_state.set_margin_end(6);
+            empty_state.add_css_class("card");
+            let message = gtk::Label::new(Some(
+                "Enable addons from the Play settings on the dashboard to use the editor and the mods folder browser.",
+            ));
+            message.set_xalign(0.0);
+            message.set_wrap(true);
+            empty_state.append(&message);
+            self.widgets.package_list_box.append(&empty_state);
+            return;
+        }
 
         let Some(mods_root) = self.mods_root_path() else {
             self.widgets.packages_panel.set_size_request(250, -1);
@@ -3692,8 +3847,9 @@ impl App {
                     return;
                 }
                 self.config.setup_complete = true;
+                self.config.setup_revision = CURRENT_SETUP_REVISION;
                 self.persist_config();
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_dashboard();
                 self.refresh_all();
             }
             SetupStep::SystemDependencies => {}
@@ -3848,6 +4004,57 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::clone(app);
+        widgets.dashboard_play_button.connect_clicked(move |_| {
+            app.borrow_mut().queue_launch_game();
+        });
+    }
+    {
+        let app = Rc::clone(app);
+        widgets.dashboard_editor_button.connect_clicked(move |_| {
+            app.borrow_mut().open_editor_browser();
+        });
+    }
+    {
+        widgets
+            .dashboard_launch_settings_button
+            .connect_clicked(move |_| {
+                with_app(|app| {
+                    let reveal = !app
+                        .widgets
+                        .dashboard_launch_settings_revealer
+                        .reveals_child();
+                    app.widgets
+                        .dashboard_launch_settings_revealer
+                        .set_reveal_child(reveal);
+                });
+            });
+    }
+    {
+        let app = Rc::clone(app);
+        widgets
+            .dashboard_addons_toggle
+            .connect_active_notify(move |toggle| {
+                let enabled = toggle.is_active();
+                let mut app = app.borrow_mut();
+                if app.config.addons_enabled != enabled {
+                    app.set_addons_enabled(enabled);
+                }
+            });
+    }
+    {
+        let app = Rc::clone(app);
+        widgets
+            .dashboard_scripts_toggle
+            .connect_active_notify(move |toggle| {
+                let enabled = toggle.is_active();
+                let mut app = app.borrow_mut();
+                if app.config.script_mods_enabled != enabled {
+                    app.set_script_mods_enabled(enabled);
+                }
+            });
+    }
+    {
+        let app = Rc::clone(app);
         widgets.save_builds_button.connect_clicked(move |_| {
             app.borrow_mut().queue_save_all_dirty_assets();
         });
@@ -3969,6 +4176,8 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
             let mut app = app.borrow_mut();
             if app.in_editor() {
                 app.close_editor_page();
+            } else if app.current_page_name().as_deref() == Some("browser") {
+                app.open_dashboard();
             } else if app.setup_required() {
                 if let Some(previous) = app.setup_step.previous() {
                     app.setup_step = previous;
@@ -4141,6 +4350,115 @@ fn build_widgets(
     setup_page.append(&setup_body_label);
     setup_page.append(&setup_scroll);
     setup_page.append(&setup_actions);
+
+    let dashboard_page = gtk::Box::new(gtk::Orientation::Vertical, 20);
+    dashboard_page.set_margin_top(28);
+    dashboard_page.set_margin_bottom(28);
+    dashboard_page.set_margin_start(28);
+    dashboard_page.set_margin_end(28);
+    let dashboard_title = gtk::Label::new(Some("GTA V Linux Dashboard"));
+    dashboard_title.set_xalign(0.0);
+    dashboard_title.add_css_class("title-1");
+    let dashboard_subtitle = gtk::Label::new(Some(
+        "Launch the Linux variant or open the editor for package and texture work.",
+    ));
+    dashboard_subtitle.set_xalign(0.0);
+    dashboard_subtitle.set_wrap(true);
+    dashboard_subtitle.add_css_class("dim-label");
+    let dashboard_cards = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    dashboard_cards.set_hexpand(true);
+    dashboard_cards.set_homogeneous(true);
+
+    let play_card = build_panel_box("Play");
+    play_card.set_hexpand(true);
+    let dashboard_play_button = gtk::Button::new();
+    dashboard_play_button.add_css_class("suggested-action");
+    dashboard_play_button.set_hexpand(true);
+    dashboard_play_button.set_vexpand(true);
+    dashboard_play_button.set_height_request(240);
+    let play_button_content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    play_button_content.set_margin_top(28);
+    play_button_content.set_margin_bottom(28);
+    play_button_content.set_margin_start(24);
+    play_button_content.set_margin_end(24);
+    let play_icon = gtk::Image::from_icon_name("media-playback-start-symbolic");
+    play_icon.set_pixel_size(48);
+    let play_title = gtk::Label::new(Some("Play GTA V"));
+    play_title.add_css_class("title-3");
+    let play_body = gtk::Label::new(Some(
+        "Prepare Wine, ensure runtime dependencies, and launch Story Mode.",
+    ));
+    play_body.set_wrap(true);
+    play_body.set_xalign(0.5);
+    play_button_content.append(&play_icon);
+    play_button_content.append(&play_title);
+    play_button_content.append(&play_body);
+    dashboard_play_button.set_child(Some(&play_button_content));
+    let dashboard_launch_settings_button = gtk::Button::from_icon_name("emblem-system-symbolic");
+    dashboard_launch_settings_button.set_tooltip_text(Some("Play settings"));
+    dashboard_launch_settings_button.add_css_class("flat");
+    dashboard_launch_settings_button.set_halign(gtk::Align::Start);
+    let dashboard_launch_settings_revealer = gtk::Revealer::new();
+    dashboard_launch_settings_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
+    dashboard_launch_settings_revealer.set_reveal_child(false);
+    let launch_settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let dashboard_addons_toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let dashboard_addons_label = gtk::Label::new(Some("Enable addons (mods folder)"));
+    dashboard_addons_label.set_xalign(0.0);
+    dashboard_addons_label.set_hexpand(true);
+    let dashboard_addons_toggle = gtk::Switch::new();
+    dashboard_addons_toggle_row.append(&dashboard_addons_label);
+    dashboard_addons_toggle_row.append(&dashboard_addons_toggle);
+    let dashboard_scripts_toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let dashboard_scripts_label = gtk::Label::new(Some("Enable script mods (scripts folder)"));
+    dashboard_scripts_label.set_xalign(0.0);
+    dashboard_scripts_label.set_hexpand(true);
+    let dashboard_scripts_toggle = gtk::Switch::new();
+    dashboard_scripts_toggle_row.append(&dashboard_scripts_label);
+    dashboard_scripts_toggle_row.append(&dashboard_scripts_toggle);
+    let dashboard_notice_label = gtk::Label::new(None);
+    dashboard_notice_label.set_xalign(0.0);
+    dashboard_notice_label.set_wrap(true);
+    dashboard_notice_label.add_css_class("caption");
+    launch_settings_box.append(&dashboard_addons_toggle_row);
+    launch_settings_box.append(&dashboard_scripts_toggle_row);
+    launch_settings_box.append(&dashboard_notice_label);
+    dashboard_launch_settings_revealer.set_child(Some(&launch_settings_box));
+    play_card.append(&dashboard_play_button);
+    play_card.append(&dashboard_launch_settings_button);
+    play_card.append(&dashboard_launch_settings_revealer);
+
+    let editor_card = build_panel_box("Editor");
+    editor_card.set_hexpand(true);
+    let dashboard_editor_button = gtk::Button::new();
+    dashboard_editor_button.set_hexpand(true);
+    dashboard_editor_button.set_vexpand(true);
+    dashboard_editor_button.set_height_request(240);
+    let editor_button_content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    editor_button_content.set_margin_top(28);
+    editor_button_content.set_margin_bottom(28);
+    editor_button_content.set_margin_start(24);
+    editor_button_content.set_margin_end(24);
+    let editor_icon = gtk::Image::from_icon_name("document-edit-symbolic");
+    editor_icon.set_pixel_size(48);
+    let editor_title = gtk::Label::new(Some("Editor"));
+    editor_title.add_css_class("title-3");
+    let editor_body = gtk::Label::new(Some(
+        "Open the current package and texture editor workflow.",
+    ));
+    editor_body.set_wrap(true);
+    editor_body.set_xalign(0.5);
+    editor_button_content.append(&editor_icon);
+    editor_button_content.append(&editor_title);
+    editor_button_content.append(&editor_body);
+    dashboard_editor_button.set_child(Some(&editor_button_content));
+    editor_card.append(&dashboard_editor_button);
+
+    dashboard_cards.append(&play_card);
+    dashboard_cards.append(&editor_card);
+    dashboard_page.append(&dashboard_title);
+    dashboard_page.append(&dashboard_subtitle);
+    dashboard_page.append(&dashboard_cards);
 
     let status_label = gtk::Label::new(None);
     status_label.set_xalign(0.0);
@@ -4471,6 +4789,7 @@ fn build_widgets(
     editor_page.append(&editor_stack);
 
     stack.add_named(&setup_page, Some("setup"));
+    stack.add_named(&dashboard_page, Some("dashboard"));
     stack.add_named(&browser_page, Some("browser"));
     stack.add_named(&editor_page, Some("editor"));
     stack.set_visible_child_name("setup");
@@ -4525,6 +4844,13 @@ fn build_widgets(
         settings_button,
         status_label,
         stack,
+        dashboard_play_button,
+        dashboard_editor_button,
+        dashboard_launch_settings_button,
+        dashboard_launch_settings_revealer,
+        dashboard_addons_toggle,
+        dashboard_scripts_toggle,
+        dashboard_notice_label,
         browser_main_paned: main_paned,
         packages_panel,
         package_target_label,
