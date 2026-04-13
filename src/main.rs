@@ -979,6 +979,7 @@ struct AppWidgets {
     dashboard_addons_toggle: gtk::Switch,
     dashboard_scripts_toggle: gtk::Switch,
     dashboard_notice_label: gtk::Label,
+    dashboard_toggle_syncing: Rc<Cell<bool>>,
     browser_main_paned: gtk::Paned,
     packages_panel: gtk::Box,
     package_target_label: gtk::Label,
@@ -1741,6 +1742,7 @@ impl App {
             .dashboard_editor_button
             .set_sensitive(!self.setup_required() && self.editor_available());
 
+        self.widgets.dashboard_toggle_syncing.set(true);
         if self.widgets.dashboard_addons_toggle.is_active() != self.config.addons_enabled {
             self.widgets
                 .dashboard_addons_toggle
@@ -1751,6 +1753,7 @@ impl App {
                 .dashboard_scripts_toggle
                 .set_active(self.config.script_mods_enabled);
         }
+        self.widgets.dashboard_toggle_syncing.set(false);
 
         let notice = if self.game_root_path().is_none() {
             "Choose the GTA V Linux game folder in setup before launching or editing.".to_owned()
@@ -4031,9 +4034,13 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::clone(app);
+        let toggle_syncing = widgets.dashboard_toggle_syncing.clone();
         widgets
             .dashboard_addons_toggle
             .connect_active_notify(move |toggle| {
+                if toggle_syncing.get() {
+                    return;
+                }
                 let enabled = toggle.is_active();
                 let mut app = app.borrow_mut();
                 if app.config.addons_enabled != enabled {
@@ -4043,9 +4050,13 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::clone(app);
+        let toggle_syncing = widgets.dashboard_toggle_syncing.clone();
         widgets
             .dashboard_scripts_toggle
             .connect_active_notify(move |toggle| {
+                if toggle_syncing.get() {
+                    return;
+                }
                 let enabled = toggle.is_active();
                 let mut app = app.borrow_mut();
                 if app.config.script_mods_enabled != enabled {
@@ -4402,6 +4413,7 @@ fn build_widgets(
     dashboard_launch_settings_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
     dashboard_launch_settings_revealer.set_reveal_child(false);
     let launch_settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let dashboard_toggle_syncing = Rc::new(Cell::new(false));
     let dashboard_addons_toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let dashboard_addons_label = gtk::Label::new(Some("Enable addons (mods folder)"));
     dashboard_addons_label.set_xalign(0.0);
@@ -4851,6 +4863,7 @@ fn build_widgets(
         dashboard_addons_toggle,
         dashboard_scripts_toggle,
         dashboard_notice_label,
+        dashboard_toggle_syncing,
         browser_main_paned: main_paned,
         packages_panel,
         package_target_label,
