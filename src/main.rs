@@ -947,6 +947,7 @@ enum JobResult {
         texture_index: usize,
         result: std::result::Result<(), String>,
     },
+    LaunchProgress(String),
     LaunchFinished(std::result::Result<String, String>),
     CopyAllFinished(std::result::Result<usize, String>),
 }
@@ -1240,11 +1241,21 @@ impl App {
 
         thread::spawn(move || {
             let result = (|| -> Result<String> {
+                let _ = tx.send(JobResult::LaunchProgress(
+                    "Preparing the Wine environment...".to_owned(),
+                ));
                 let prepare = launcher::prepare_environment(&workspace_dir)
                     .map_err(|error| anyhow!(error.to_string()))?;
+                let _ = tx.send(JobResult::LaunchProgress(
+                    "Checking or installing runtime dependencies. This can take several minutes on first launch..."
+                        .to_owned(),
+                ));
                 let dependency_status =
                     launcher::ensure_runtime_dependencies(&workspace_dir, &prepare)
                         .map_err(|error| anyhow!(error.to_string()))?;
+                let _ = tx.send(JobResult::LaunchProgress(
+                    "Launching PlayGTAV.exe...".to_owned(),
+                ));
                 launcher::launch_game_prepared(&game_root, &prepare)
                     .map_err(|error| anyhow!(error.to_string()))?;
                 Ok(format!(
@@ -1454,14 +1465,15 @@ impl App {
         let setup_required = self.setup_required();
         let current_page = self.current_page_name();
         let on_browser = current_page.as_deref() == Some("browser");
+        let on_dashboard = current_page.as_deref() == Some("dashboard");
 
         self.widgets.back_button.set_visible(
             in_editor || matches!(current_page.as_deref(), Some("browser") | Some("setup")),
         );
         self.widgets
             .app_menu_button
-            .set_sensitive(!in_editor && on_browser);
-        if !on_browser {
+            .set_sensitive(!in_editor && (on_browser || on_dashboard));
+        if !(on_browser || on_dashboard) {
             self.widgets.app_menu_button.set_active(false);
         }
         let mod_folder_text = match (
@@ -1735,6 +1747,9 @@ impl App {
         self.widgets
             .dashboard_launch_settings_button
             .set_visible(on_dashboard && self.game_root_path().is_some());
+        self.widgets
+            .dashboard_launch_settings_revealer
+            .set_reveal_child(self.config.play_settings_expanded);
         self.widgets
             .dashboard_play_button
             .set_sensitive(!self.setup_required() && self.game_root_path().is_some());
@@ -2262,9 +2277,14 @@ impl App {
 
     fn handle_job_results(&mut self) {
         while let Ok(job) = self.job_rx.try_recv() {
-            self.pending_jobs = self.pending_jobs.saturating_sub(1);
+            if !matches!(job, JobResult::LaunchProgress(_)) {
+                self.pending_jobs = self.pending_jobs.saturating_sub(1);
+            }
 
             match job {
+                JobResult::LaunchProgress(message) => {
+                    self.set_status(message);
+                }
                 JobResult::ImportFinished {
                     source_path,
                     result,
@@ -4029,6 +4049,8 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
                     app.widgets
                         .dashboard_launch_settings_revealer
                         .set_reveal_child(reveal);
+                    app.config.play_settings_expanded = reveal;
+                    app.persist_config();
                 });
             });
     }
@@ -4325,6 +4347,9 @@ fn build_widgets(
     let stack = gtk::Stack::new();
     stack.set_hexpand(true);
     stack.set_vexpand(true);
+    let content_overlay = gtk::Overlay::new();
+    content_overlay.set_hexpand(true);
+    content_overlay.set_vexpand(true);
 
     let setup_page = gtk::Box::new(gtk::Orientation::Vertical, 16);
     setup_page.set_margin_top(28);
@@ -4411,7 +4436,7 @@ fn build_widgets(
     dashboard_launch_settings_button.set_halign(gtk::Align::Start);
     let dashboard_launch_settings_revealer = gtk::Revealer::new();
     dashboard_launch_settings_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-    dashboard_launch_settings_revealer.set_reveal_child(false);
+    dashboard_launch_settings_revealer.set_reveal_child(config.play_settings_expanded);
     let launch_settings_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let dashboard_toggle_syncing = Rc::new(Cell::new(false));
     let dashboard_addons_toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -4703,8 +4728,6 @@ fn build_widgets(
     right_paned.set_start_child(Some(&textures_panel));
     right_paned.set_end_child(Some(&preview_panel));
     browser_overlay.set_child(Some(&main_paned));
-    browser_overlay.add_overlay(&settings_backdrop);
-    browser_overlay.add_overlay(&settings_revealer);
     browser_page.append(&browser_overlay);
 
     let editor_page = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -4806,9 +4829,13 @@ fn build_widgets(
     stack.add_named(&editor_page, Some("editor"));
     stack.set_visible_child_name("setup");
 
+    content_overlay.set_child(Some(&stack));
+    content_overlay.add_overlay(&settings_backdrop);
+    content_overlay.add_overlay(&settings_revealer);
+
     let copy_destination_window: gtk::Window = window.clone().upcast();
 
-    root.append(&stack);
+    root.append(&content_overlay);
     root.append(&status_button);
 
     let toolbar_view = adw::ToolbarView::new();
