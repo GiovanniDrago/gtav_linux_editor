@@ -1,4 +1,6 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Text;
 using System.Xml;
 using CodeWalker.GameFiles;
 using CodeWalker.Utils;
@@ -29,7 +31,9 @@ static string FullPath(string path) => Path.GetFullPath(path);
 
 static (string RootPath, bool Gen9)? FindGameRoot(string path)
 {
-    var current = new FileInfo(path).Directory;
+    var current = Directory.Exists(path)
+        ? new DirectoryInfo(path)
+        : new FileInfo(path).Directory;
     while (current != null)
     {
         if (Directory.EnumerateFiles(current.FullName)
@@ -64,6 +68,7 @@ static void EnsureGameKeys(string path)
     }
 
     GTA5Keys.LoadFromPath(gameRoot.Value.RootPath, gameRoot.Value.Gen9, null);
+    GTA5Hash.LUT = GTA5Keys.PC_LUT;
     KeyLoadState.LoadedKeysRoot = gameRoot.Value.RootPath;
 }
 
@@ -279,6 +284,167 @@ static RpfManager CreateRpfManager(RpfFile rootFile)
     return manager;
 }
 
+static void PrimeFullGameJenkIndex(string path)
+{
+    var gameRoot = FindGameRoot(path);
+    if (gameRoot == null)
+    {
+        return;
+    }
+
+    EnsureGameKeys(gameRoot.Value.RootPath);
+    var manager = new RpfManager();
+    manager.Init(gameRoot.Value.RootPath, gameRoot.Value.Gen9, _ => { }, _ => { }, buildIndex: true);
+    PrimePedModelNames(manager);
+    PrimeAmbientPedModelSetNames(manager);
+    PrimeRawTextNames(manager);
+}
+
+static void EnsureJenkString(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+    {
+        return;
+    }
+
+    JenkIndex.Ensure(value);
+    JenkIndex.Ensure(value.ToLowerInvariant());
+}
+
+static void PrimePedModelNames(RpfManager manager)
+{
+    foreach (var entry in manager.EntryDict.Values.OfType<RpfFileEntry>())
+    {
+        if (!string.Equals(entry.NameLower, "peds.meta", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(entry.NameLower, "peds.ymt", StringComparison.OrdinalIgnoreCase))
+        {
+            continue;
+        }
+
+        try
+        {
+            var data = entry.File.ExtractFile(entry);
+            if (data == null)
+            {
+                continue;
+            }
+
+            var peds = new PedsFile(entry);
+            peds.Load(data, entry);
+            var initDataList = peds.InitDataList;
+            if (initDataList == null)
+            {
+                continue;
+            }
+
+            EnsureJenkString(initDataList.residentTxd);
+            if (initDataList.residentAnims != null)
+            {
+                foreach (var animation in initDataList.residentAnims)
+                {
+                    EnsureJenkString(animation);
+                }
+            }
+
+            if (initDataList.InitDatas != null)
+            {
+                foreach (var initData in initDataList.InitDatas)
+                {
+                    EnsureJenkString(initData.Name);
+                    EnsureJenkString(initData.PropsName);
+                    EnsureJenkString(initData.ClipDictionaryName);
+                    EnsureJenkString(initData.ExpressionDictionaryName);
+                    EnsureJenkString(initData.ExpressionName);
+                    EnsureJenkString(initData.CreatureMetadataName);
+                    EnsureJenkString(initData.PedVoiceGroup);
+                }
+            }
+        }
+        catch
+        {
+        }
+    }
+}
+
+static void PrimeAmbientPedModelSetNames(RpfManager manager)
+{
+    foreach (var path in new[]
+    {
+        "update\\update.rpf\\common\\data\\ai\\ambientpedmodelsets.meta",
+        "common.rpf\\data\\ai\\ambientpedmodelsets.meta",
+    })
+    {
+        try
+        {
+            var xml = manager.GetFileXml(path);
+            var items = xml?.DocumentElement?.SelectNodes("ModelSets/Item");
+            if (items == null)
+            {
+                continue;
+            }
+
+            foreach (XmlNode item in items)
+            {
+                EnsureJenkString(item.SelectSingleNode("Name")?.InnerText);
+                var modelNodes = item.SelectNodes("Models/Item/Name");
+                if (modelNodes == null)
+                {
+                    continue;
+                }
+
+                foreach (XmlNode modelNode in modelNodes)
+                {
+                    EnsureJenkString(modelNode.InnerText);
+                }
+            }
+        }
+        catch
+        {
+        }
+    }
+}
+
+static void PrimeRawTextNames(RpfManager manager)
+{
+    foreach (var entry in manager.EntryDict.Values.OfType<RpfFileEntry>())
+    {
+        var extension = Path.GetExtension(entry.NameLower);
+        if (extension != ".meta" && extension != ".xml")
+        {
+            continue;
+        }
+
+        try
+        {
+            var data = entry.File.ExtractFile(entry);
+            if (data == null || data.Length == 0 || data.Length > 4 * 1024 * 1024)
+            {
+                continue;
+            }
+
+            var text = Encoding.UTF8.GetString(data);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                continue;
+            }
+
+            foreach (Match match in Regex.Matches(text, @"\b[A-Za-z][A-Za-z0-9_]{2,}\b"))
+            {
+                var value = match.Value;
+                if (value.StartsWith("hash_", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                EnsureJenkString(value);
+            }
+        }
+        catch
+        {
+        }
+    }
+}
+
 static List<RpfTreeNode> BuildRpfChildren(RpfDirectoryEntry directory, RpfFile archive, string parentDisplayPath)
 {
     if (directory == null)
@@ -407,6 +573,7 @@ static string ExportYmtXml(RpfFileEntry entry, byte[] data, string outputDir)
 
 static int ExportRpfYmtEntry(string rpfPath, string entryPath, string outputDir)
 {
+    PrimeFullGameJenkIndex(rpfPath);
     var root = LoadRpf(rpfPath);
     var manager = CreateRpfManager(root);
     var entry = manager.GetEntry(entryPath) as RpfFileEntry

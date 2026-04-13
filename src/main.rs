@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -169,7 +169,7 @@ struct AppConfig {
     setup_complete: bool,
     copy_destination: String,
     theme: ThemePreference,
-    mod_folder_path: Option<PathBuf>,
+    game_root_path: Option<PathBuf>,
     backup_before_save: bool,
     last_asset_dir: Option<PathBuf>,
     last_image_dir: Option<PathBuf>,
@@ -182,11 +182,49 @@ impl Default for AppConfig {
             setup_complete: false,
             copy_destination: String::new(),
             theme: ThemePreference::System,
-            mod_folder_path: None,
+            game_root_path: None,
             backup_before_save: true,
             last_asset_dir: None,
             last_image_dir: None,
             last_copy_dir: None,
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct AppConfigFile {
+    setup_complete: bool,
+    copy_destination: String,
+    theme: Option<ThemePreference>,
+    game_root_path: Option<PathBuf>,
+    mod_folder_path: Option<PathBuf>,
+    backup_before_save: Option<bool>,
+    last_asset_dir: Option<PathBuf>,
+    last_image_dir: Option<PathBuf>,
+    last_copy_dir: Option<PathBuf>,
+}
+
+impl From<AppConfigFile> for AppConfig {
+    fn from(value: AppConfigFile) -> Self {
+        let inferred_game_root = value.game_root_path.or_else(|| {
+            value.mod_folder_path.as_ref().and_then(|mod_folder_path| {
+                mod_folder_path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("mods"))
+                    .then(|| mod_folder_path.parent().map(Path::to_path_buf))
+                    .flatten()
+            })
+        });
+
+        Self {
+            setup_complete: value.setup_complete,
+            copy_destination: value.copy_destination,
+            theme: value.theme.unwrap_or(ThemePreference::System),
+            game_root_path: inferred_game_root,
+            backup_before_save: value.backup_before_save.unwrap_or(true),
+            last_asset_dir: value.last_asset_dir,
+            last_image_dir: value.last_image_dir,
+            last_copy_dir: value.last_copy_dir,
         }
     }
 }
@@ -200,7 +238,8 @@ impl AppConfig {
         let path = Self::path(tool_paths);
         fs::read_to_string(&path)
             .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
+            .and_then(|content| serde_json::from_str::<AppConfigFile>(&content).ok())
+            .map(Into::into)
             .unwrap_or_default()
     }
 
@@ -217,6 +256,7 @@ enum SetupStep {
     ExternalTools,
     SystemDependencies,
     BuildHelper,
+    GameFolder,
     Ready,
 }
 
@@ -226,7 +266,8 @@ impl SetupStep {
             Self::Welcome => Some(Self::ExternalTools),
             Self::ExternalTools => Some(Self::SystemDependencies),
             Self::SystemDependencies => Some(Self::BuildHelper),
-            Self::BuildHelper => Some(Self::Ready),
+            Self::BuildHelper => Some(Self::GameFolder),
+            Self::GameFolder => Some(Self::Ready),
             Self::Ready => None,
         }
     }
@@ -237,7 +278,8 @@ impl SetupStep {
             Self::ExternalTools => Some(Self::Welcome),
             Self::SystemDependencies => Some(Self::ExternalTools),
             Self::BuildHelper => Some(Self::SystemDependencies),
-            Self::Ready => Some(Self::BuildHelper),
+            Self::GameFolder => Some(Self::BuildHelper),
+            Self::Ready => Some(Self::GameFolder),
         }
     }
 
@@ -247,6 +289,7 @@ impl SetupStep {
             Self::ExternalTools => "External Tools",
             Self::SystemDependencies => "System Dependencies",
             Self::BuildHelper => "Build Helper",
+            Self::GameFolder => "Game Folder",
             Self::Ready => "Ready",
         }
     }
@@ -668,6 +711,24 @@ impl ImportedArchiveEntry {
             self.content_kind,
             ArchiveContentKind::XmlText | ArchiveContentKind::ConvertedXml
         )
+    }
+
+    fn matches_node_content(&self, node: &RpfTreeNode) -> bool {
+        if self.content_kind != node.content_kind {
+            return false;
+        }
+
+        match node.content_kind {
+            ArchiveContentKind::ConvertedXml => self
+                .text_source_path()
+                .and_then(|path| path.extension())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("xml")),
+            ArchiveContentKind::Folder
+            | ArchiveContentKind::Package
+            | ArchiveContentKind::TextureAsset
+            | ArchiveContentKind::XmlText
+            | ArchiveContentKind::File => true,
+        }
     }
 }
 
@@ -1198,7 +1259,7 @@ impl App {
             last_image_dir: None,
             last_copy_dir: None,
             pending_jobs: 0,
-            status: "Ready. Choose the GTA V mods folder to begin.".to_owned(),
+            status: "Ready. Choose the GTA V game folder to begin.".to_owned(),
             job_tx,
             job_rx,
             widgets,
@@ -1209,7 +1270,8 @@ impl App {
             borrowed.last_asset_dir = borrowed.config.last_asset_dir.clone();
             borrowed.last_image_dir = borrowed.config.last_image_dir.clone();
             borrowed.last_copy_dir = borrowed.config.last_copy_dir.clone();
-            if let Some(path) = borrowed.config.mod_folder_path.clone() {
+            if let Some(path) = borrowed.mods_root_path() {
+                let _ = fs::create_dir_all(&path);
                 borrowed.mod_tree_expanded_paths.insert(path);
             }
         }
@@ -1217,6 +1279,9 @@ impl App {
         connect_signals(&app);
         attach_job_poller(&app);
         app.borrow_mut().refresh_all();
+        if !app.borrow().setup_required() {
+            app.borrow().widgets.stack.set_visible_child_name("browser");
+        }
         app.borrow().widgets.window.present();
         Ok(app)
     }
@@ -1233,7 +1298,9 @@ impl App {
     }
 
     fn setup_required(&self) -> bool {
-        !self.config.setup_complete || !self.setup_status.setup_ready()
+        !self.config.setup_complete
+            || !self.setup_status.setup_ready()
+            || self.game_root_path().is_none()
     }
 
     fn persist_config(&self) {
@@ -1248,19 +1315,41 @@ impl App {
             .add_toast(adw::Toast::new(message.as_ref()));
     }
 
-    fn mods_root_path(&self) -> Option<&Path> {
+    fn game_root_path(&self) -> Option<&Path> {
         self.config
-            .mod_folder_path
+            .game_root_path
             .as_deref()
             .filter(|path| path.is_dir())
     }
 
-    fn set_mod_folder_path(&mut self, path: PathBuf) {
-        self.config.mod_folder_path = Some(path.clone());
+    fn mods_root_path(&self) -> Option<PathBuf> {
+        self.game_root_path().map(|path| path.join("mods"))
+    }
+
+    fn set_game_root_path(&mut self, path: PathBuf) {
+        let (game_root, selected_mods_folder) = normalize_selected_game_root(&path);
+        if !is_valid_game_root(&game_root) {
+            self.set_status(format!(
+                "{} does not look like a GTA V game folder.",
+                path.display()
+            ));
+            return;
+        }
+
+        let mods_path = game_root.join("mods");
+        if let Err(error) = fs::create_dir_all(&mods_path) {
+            self.set_status(format!(
+                "Failed to create mods folder at {}: {error}",
+                mods_path.display()
+            ));
+            return;
+        }
+
+        self.config.game_root_path = Some(game_root.clone());
         self.mod_tree_expanded_paths.clear();
-        self.mod_tree_expanded_paths.insert(path.clone());
+        self.mod_tree_expanded_paths.insert(mods_path.clone());
         self.selected_mod_path = None;
-        self.current_mod_browser_path = Some(path.clone());
+        self.current_mod_browser_path = Some(mods_path.clone());
         self.pending_import_paths.clear();
         self.assets.clear();
         self.selected_asset = None;
@@ -1269,8 +1358,16 @@ impl App {
         self.text_editor = None;
         self.close_settings_panel();
         self.persist_config();
-        self.set_status(format!("Using GTA V mods folder at {}", path.display()));
-        self.show_toast("GTA V mods folder updated.");
+        self.set_status(format!(
+            "Using GTA V game folder at {} and mods folder at {}",
+            game_root.display(),
+            mods_path.display()
+        ));
+        if selected_mods_folder {
+            self.show_toast("Using the parent GTA V game folder and its mods subfolder.");
+        } else {
+            self.show_toast("GTA V game folder updated.");
+        }
         self.refresh_all();
     }
 
@@ -1281,11 +1378,11 @@ impl App {
 
     fn open_mods_root_folder(&mut self) {
         let Some(directory) = self.mods_root_path() else {
-            self.set_status("Choose a GTA V mods folder first.");
+            self.set_status("Choose a GTA V game folder first.");
             return;
         };
 
-        if let Err(error) = open_directory(directory) {
+        if let Err(error) = open_directory(&directory) {
             self.set_status(format!("Failed to open folder: {error:#}"));
         }
     }
@@ -1315,6 +1412,12 @@ impl App {
         self.refresh_all();
     }
 
+    fn show_browser_if_editor_visible(&self) {
+        if self.widgets.stack.visible_child_name().as_deref() == Some("editor") {
+            self.widgets.stack.set_visible_child_name("browser");
+        }
+    }
+
     fn refresh_header(&self) {
         let in_editor = self.in_editor();
         let setup_required = self.setup_required();
@@ -1323,12 +1426,14 @@ impl App {
             .back_button
             .set_visible(in_editor || setup_required);
         self.widgets.app_menu_button.set_sensitive(!in_editor);
-        let mod_folder_text = self
-            .config
-            .mod_folder_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "Not configured".to_owned());
+        let mod_folder_text = match (self.game_root_path(), self.mods_root_path()) {
+            (Some(game_root), Some(mods_root)) => format!(
+                "Game: {}\nMods: {}",
+                game_root.display(),
+                mods_root.display()
+            ),
+            _ => "Not configured".to_owned(),
+        };
         self.widgets
             .mod_folder_path_label
             .set_text(&mod_folder_text);
@@ -1384,6 +1489,7 @@ impl App {
                         && self.setup_status.magick_available
                 }
                 SetupStep::BuildHelper => self.setup_status.cwassettool_binary,
+                SetupStep::GameFolder => self.game_root_path().is_some(),
                 SetupStep::Ready => false,
             });
         self.widgets
@@ -1393,6 +1499,7 @@ impl App {
                 SetupStep::ExternalTools => !self.setup_status.codewalker_source,
                 SetupStep::SystemDependencies => false,
                 SetupStep::BuildHelper => !self.setup_status.cwassettool_binary,
+                SetupStep::GameFolder => true,
                 SetupStep::Ready => self.setup_status.setup_ready(),
             });
     }
@@ -1446,6 +1553,10 @@ impl App {
                 } else {
                     None
                 },
+            ),
+            SetupStep::GameFolder => (
+                "Choose the GTA V game folder. The app will automatically use or create the mods folder inside it, while all temporary edit files stay in the app workspace.",
+                Some("Choose Game Folder"),
             ),
             SetupStep::Ready => (
                 "Setup is complete. You can continue into the main application. You can run the wizard again later from the app menu.",
@@ -1519,11 +1630,29 @@ impl App {
                     .setup_list_box
                     .append(&setup_info_row("Build target", ".NET Release / net10.0"));
             }
+            SetupStep::GameFolder => {
+                let game_root = self
+                    .game_root_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Not configured".to_owned());
+                let mods_root = self
+                    .mods_root_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Will be created automatically".to_owned());
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "Game folder",
+                    self.game_root_path().is_some(),
+                    &game_root,
+                ));
+                self.widgets
+                    .setup_list_box
+                    .append(&setup_info_row("Derived mods folder", &mods_root));
+            }
             SetupStep::Ready => {
                 self.widgets.setup_list_box.append(&setup_status_row(
                     "Setup complete",
-                    self.setup_status.setup_ready(),
-                    "All required tools are present and verified",
+                    self.setup_status.setup_ready() && self.game_root_path().is_some(),
+                    "All required tools are present and the GTA V game folder is configured",
                 ));
             }
         }
@@ -1785,9 +1914,17 @@ impl App {
         asset.archive_file_notice = None;
         self.selected_texture = None;
 
-        if let Some(existing_kind) = asset
+        let cached_entry_usable = asset
             .find_archive_entry(&entry_path)
-            .map(|entry| entry.content_kind)
+            .is_some_and(|entry| entry.matches_node_content(&node));
+
+        if let Some(existing_kind) = cached_entry_usable
+            .then(|| {
+                asset
+                    .find_archive_entry(&entry_path)
+                    .map(|entry| entry.content_kind)
+            })
+            .flatten()
         {
             asset.archive_file_loading_path = None;
             match existing_kind {
@@ -1805,6 +1942,30 @@ impl App {
                     self.selected_texture = if texture_count == 0 { None } else { Some(0) };
                 }
                 ArchiveContentKind::XmlText | ArchiveContentKind::ConvertedXml => {
+                    if existing_kind == ArchiveContentKind::ConvertedXml {
+                        if let Some(entry) = asset.find_archive_entry_mut(&entry_path) {
+                            if let Some(source_path) =
+                                entry.text_source_path().map(Path::to_path_buf)
+                            {
+                                if let Ok(text) = fs::read_to_string(&source_path) {
+                                    if let Ok(resolved_text) =
+                                        apply_known_hash_name_overrides(&text)
+                                    {
+                                        if resolved_text != text {
+                                            let _ = fs::write(&source_path, &resolved_text);
+                                        }
+                                        if let ImportedArchiveEntryData::XmlText {
+                                            original_text,
+                                            ..
+                                        } = &mut entry.data
+                                        {
+                                            *original_text = resolved_text;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     asset.archive_file_notice = None;
                     self.selected_texture = None;
                 }
@@ -2350,7 +2511,7 @@ impl App {
             self.widgets.save_builds_button.set_sensitive(false);
             self.widgets
                 .package_target_label
-                .set_text("GTA V mods folder not configured");
+                .set_text("GTA V game folder not configured");
             let empty_state = gtk::Box::new(gtk::Orientation::Vertical, 12);
             empty_state.set_margin_top(20);
             empty_state.set_margin_bottom(12);
@@ -2359,7 +2520,7 @@ impl App {
             empty_state.add_css_class("card");
             let choose_button = gtk::Button::from_icon_name("folder-open-symbolic");
             choose_button.add_css_class("suggested-action");
-            choose_button.set_tooltip_text(Some("Choose GTA V mods folder"));
+            choose_button.set_tooltip_text(Some("Choose GTA V game folder"));
             choose_button.connect_clicked(move |_| {
                 with_app_ref(|app| {
                     present_mod_folder_dialog(&app);
@@ -2367,7 +2528,7 @@ impl App {
             });
             choose_button.set_halign(gtk::Align::Start);
             let message = gtk::Label::new(Some(
-                "The GTA V mods folder is required. It is important to make a backup before changing files.",
+                "The GTA V game folder is required. The app will automatically use or create the mods folder inside it.",
             ));
             message.set_xalign(0.0);
             message.set_wrap(true);
@@ -2388,7 +2549,7 @@ impl App {
         self.widgets
             .save_builds_button
             .set_sensitive(self.assets.iter().any(|asset| asset.dirty));
-        append_mod_folder_rows(self, &self.widgets.package_list_box, mods_root, 0);
+        append_mod_folder_rows(self, &self.widgets.package_list_box, &mods_root, 0);
     }
 
     fn refresh_textures_list(&self) {
@@ -2852,15 +3013,15 @@ impl App {
 
         if let Some(text_editor) = &self.text_editor {
             let Some(asset) = self.assets.get(text_editor.asset_index) else {
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_browser_if_editor_visible();
                 return;
             };
             let Some(entry) = asset.find_archive_entry(&text_editor.entry_path) else {
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_browser_if_editor_visible();
                 return;
             };
             let Some(original_text) = entry.original_text() else {
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_browser_if_editor_visible();
                 return;
             };
 
@@ -2893,21 +3054,21 @@ impl App {
         }
 
         let Some(editor) = &self.editor else {
-            self.widgets.stack.set_visible_child_name("browser");
+            self.show_browser_if_editor_visible();
             return;
         };
 
         let asset = &self.assets[editor.asset_index];
         let texture = if let Some(entry_path) = editor.entry_path.as_deref() {
             let Some(entry) = asset.find_archive_entry(entry_path) else {
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_browser_if_editor_visible();
                 return;
             };
             let Some(texture) = entry
                 .textures()
                 .and_then(|textures| textures.get(editor.texture_index))
             else {
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_browser_if_editor_visible();
                 return;
             };
             self.widgets.editor_title_label.set_text(&format!(
@@ -2919,7 +3080,7 @@ impl App {
             texture
         } else {
             let Some(texture) = asset.textures.get(editor.texture_index) else {
-                self.widgets.stack.set_visible_child_name("browser");
+                self.show_browser_if_editor_visible();
                 return;
             };
             self.widgets.editor_title_label.set_text(&format!(
@@ -3066,12 +3227,12 @@ impl App {
     fn mod_browser_parent_path(&self) -> Option<PathBuf> {
         let current = self.current_mod_browser_path.as_ref()?;
         let root = self.mods_root_path()?;
-        if current == root {
+        if current == &root {
             return None;
         }
 
         let parent = current.parent()?;
-        parent.starts_with(root).then(|| parent.to_path_buf())
+        parent.starts_with(&root).then(|| parent.to_path_buf())
     }
 
     fn open_mod_browser_parent(&mut self) {
@@ -3518,8 +3679,15 @@ impl App {
                     self.queue_build_helper();
                 }
             }
+            SetupStep::GameFolder => {
+                gtk::glib::idle_add_local_once(|| {
+                    with_app_ref(|app_ref| {
+                        present_mod_folder_dialog(&app_ref);
+                    });
+                });
+            }
             SetupStep::Ready => {
-                if !self.setup_status.setup_ready() {
+                if !self.setup_status.setup_ready() || self.game_root_path().is_none() {
                     self.set_status("Setup is not complete yet.");
                     return;
                 }
@@ -3628,7 +3796,12 @@ fn connect_signals(app: &Rc<RefCell<App>>) {
     {
         let app = Rc::clone(app);
         widgets.rerun_setup_button.connect_clicked(move |_| {
-            app.borrow_mut().rerun_setup_wizard();
+            let app = Rc::clone(&app);
+            gtk::glib::idle_add_local_once(move || {
+                let mut app = app.borrow_mut();
+                app.close_settings_panel();
+                app.rerun_setup_wizard();
+            });
         });
     }
     {
@@ -4017,7 +4190,7 @@ fn build_widgets(
     settings_backdrop.set_opacity(0.35);
     let settings_panel = build_panel_box("Settings");
     settings_panel.set_size_request(320, -1);
-    let mod_folder_label = gtk::Label::new(Some("GTA V mods folder"));
+    let mod_folder_label = gtk::Label::new(Some("GTA V game and mods folders"));
     mod_folder_label.set_xalign(0.0);
     let mod_folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let mod_folder_path_label = gtk::Label::new(Some("Not configured"));
@@ -4027,9 +4200,9 @@ fn build_widgets(
     mod_folder_path_label.add_css_class("caption");
     let open_mod_folder_button = gtk::Button::from_icon_name("folder-open-symbolic");
     open_mod_folder_button.add_css_class("flat");
-    open_mod_folder_button.set_tooltip_text(Some("Open GTA V mods folder"));
+    open_mod_folder_button.set_tooltip_text(Some("Open derived GTA V mods folder"));
     open_mod_folder_button.set_valign(gtk::Align::Start);
-    let change_mod_folder_button = gtk::Button::with_label("Choose Mods Folder");
+    let change_mod_folder_button = gtk::Button::with_label("Choose Game Folder");
     mod_folder_row.append(&mod_folder_path_label);
     mod_folder_row.append(&open_mod_folder_button);
     let backup_before_save_check =
@@ -4071,7 +4244,7 @@ fn build_widgets(
 
     let packages_panel = build_panel_box("Mod Files");
     packages_panel.set_size_request(320, -1);
-    let package_target_label = gtk::Label::new(Some("GTA V mods folder not configured"));
+    let package_target_label = gtk::Label::new(Some("GTA V game folder not configured"));
     package_target_label.set_xalign(0.0);
     package_target_label.set_wrap(true);
     package_target_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
@@ -5584,13 +5757,13 @@ fn present_copy_destination_dialog(app: &Rc<RefCell<App>>) {
 fn present_mod_folder_dialog(app: &Rc<RefCell<App>>) {
     let app_borrow = app.borrow();
     let dialog = gtk::FileDialog::builder()
-        .title("Choose GTA V mods folder")
+        .title("Choose GTA V game folder")
         .modal(true)
         .build();
 
     if let Some(dir) = app_borrow
         .config
-        .mod_folder_path
+        .game_root_path
         .as_ref()
         .filter(|dir| dir.exists())
     {
@@ -5613,7 +5786,7 @@ fn present_mod_folder_dialog(app: &Rc<RefCell<App>>) {
                 let mut app = app_ref.borrow_mut();
                 app.last_asset_dir = Some(path.clone());
                 app.config.last_asset_dir = app.last_asset_dir.clone();
-                app.set_mod_folder_path(path);
+                app.set_game_root_path(path);
             }
         }
     });
@@ -5905,12 +6078,17 @@ fn export_archive_ymt_draft(
     let source_path = parse_named_output_path(&stdout, "xml")?;
     let original_text = fs::read_to_string(&source_path)
         .with_context(|| format!("Failed to read {} as UTF-8 text", source_path.display()))?;
+    let resolved_text = apply_known_hash_name_overrides(&original_text)?;
+    if resolved_text != original_text {
+        fs::write(&source_path, &resolved_text)
+            .with_context(|| format!("Failed to update {}", source_path.display()))?;
+    }
 
     Ok(ImportedArchiveTextDraft {
         entry_path: entry_path.to_owned(),
         title: entry_name,
         source_path,
-        original_text,
+        original_text: resolved_text,
         source_kind: ArchiveTextSourceKind::YmtXml,
     })
 }
@@ -6270,6 +6448,93 @@ fn parse_named_output_path(stdout: &str, key: &str) -> Result<PathBuf> {
         .find_map(|line| line.strip_prefix(&prefix))
         .map(PathBuf::from)
         .with_context(|| format!("Expected {key}=... in helper output"))
+}
+
+fn load_known_hash_name_overrides() -> Result<HashMap<u32, String>> {
+    let content = fs::read_to_string(asset_icon_path("hash_name_seeds.txt"))?;
+    let mut overrides = HashMap::new();
+    for line in content.lines() {
+        let name = line.trim();
+        if name.is_empty() || name.starts_with('#') {
+            continue;
+        }
+        overrides.insert(jenk_hash(name), name.to_owned());
+    }
+    Ok(overrides)
+}
+
+fn apply_known_hash_name_overrides(text: &str) -> Result<String> {
+    let overrides = load_known_hash_name_overrides()?;
+    Ok(replace_hash_placeholders(text, &overrides))
+}
+
+fn replace_hash_placeholders(text: &str, overrides: &HashMap<u32, String>) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"hash_") && index + 13 <= bytes.len() {
+            let candidate = &text[index + 5..index + 13];
+            if candidate.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                if let Ok(hash) = u32::from_str_radix(candidate, 16) {
+                    if let Some(name) = overrides.get(&hash) {
+                        output.push_str(name);
+                        index += 13;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let ch = text[index..].chars().next().unwrap();
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+
+    output
+}
+
+fn jenk_hash(value: &str) -> u32 {
+    let mut hash = 0u32;
+    for byte in value.to_ascii_lowercase().bytes() {
+        hash = hash.wrapping_add(byte as u32);
+        hash = hash.wrapping_add(hash << 10);
+        hash ^= hash >> 6;
+    }
+    hash = hash.wrapping_add(hash << 3);
+    hash ^= hash >> 11;
+    hash.wrapping_add(hash << 15)
+}
+
+fn normalize_selected_game_root(path: &Path) -> (PathBuf, bool) {
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("mods"))
+    {
+        if let Some(parent) = path.parent() {
+            if is_valid_game_root(parent) {
+                return (parent.to_path_buf(), true);
+            }
+        }
+    }
+
+    (path.to_path_buf(), false)
+}
+
+fn is_valid_game_root(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .any(|name| {
+            name.eq_ignore_ascii_case("gta5.exe") || name.eq_ignore_ascii_case("gta5_enhanced.exe")
+        })
 }
 
 fn apply_theme(preference: ThemePreference) {
