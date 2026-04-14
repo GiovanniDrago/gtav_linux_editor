@@ -8,6 +8,7 @@ pub enum SetupStep {
     SystemDependencies,
     BuildHelper,
     GameFolder,
+    VulkanRuntime,
     Ready,
 }
 
@@ -18,7 +19,8 @@ impl SetupStep {
             Self::ExternalTools => Some(Self::SystemDependencies),
             Self::SystemDependencies => Some(Self::BuildHelper),
             Self::BuildHelper => Some(Self::GameFolder),
-            Self::GameFolder => Some(Self::Ready),
+            Self::GameFolder => Some(Self::VulkanRuntime),
+            Self::VulkanRuntime => Some(Self::Ready),
             Self::Ready => None,
         }
     }
@@ -30,7 +32,8 @@ impl SetupStep {
             Self::SystemDependencies => Some(Self::ExternalTools),
             Self::BuildHelper => Some(Self::SystemDependencies),
             Self::GameFolder => Some(Self::BuildHelper),
-            Self::Ready => Some(Self::GameFolder),
+            Self::VulkanRuntime => Some(Self::GameFolder),
+            Self::Ready => Some(Self::VulkanRuntime),
         }
     }
 
@@ -41,6 +44,7 @@ impl SetupStep {
             Self::SystemDependencies => "System Dependencies",
             Self::BuildHelper => "Build Helper",
             Self::GameFolder => "Game Folder",
+            Self::VulkanRuntime => "Vulkan Runtime",
             Self::Ready => "Ready",
         }
     }
@@ -57,6 +61,9 @@ pub struct SetupStatus {
     pub wineboot_available: bool,
     pub wineserver_available: bool,
     pub winetricks_available: bool,
+    pub bash_available: bool,
+    pub tar_available: bool,
+    pub vulkan_runtime_ready: bool,
 }
 
 impl SetupStatus {
@@ -73,6 +80,9 @@ impl SetupStatus {
             wineboot_available: launcher_dependencies.wineboot_available,
             wineserver_available: launcher_dependencies.wineserver_available,
             winetricks_available: launcher_dependencies.winetricks_available,
+            bash_available: launcher_dependencies.bash_available,
+            tar_available: launcher_dependencies.tar_available,
+            vulkan_runtime_ready: launcher::vulkan_runtime_ready(&tool_paths.workspace_dir),
         }
     }
 
@@ -87,5 +97,8 @@ impl SetupStatus {
             && self.wineboot_available
             && self.wineserver_available
             && self.winetricks_available
+            && self.bash_available
+            && self.tar_available
+            && self.vulkan_runtime_ready
     }
 }

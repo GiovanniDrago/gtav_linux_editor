@@ -930,6 +930,7 @@ enum JobResult {
     },
     DownloadCodeWalkerFinished(std::result::Result<(), String>),
     BuildHelperFinished(std::result::Result<(), String>),
+    PrepareVulkanRuntimeFinished(std::result::Result<String, String>),
     UpdateCodeWalkerFinished(std::result::Result<String, String>),
     PreviewFinished {
         asset_id: String,
@@ -1259,8 +1260,9 @@ impl App {
                 launcher::launch_game_prepared(&game_root, &prepare)
                     .map_err(|error| anyhow!(error.to_string()))?;
                 Ok(format!(
-                    "Started GTA V (runtime dependencies {}).",
+                    "Started GTA V (runtime dependencies {}, Vulkan {}).",
                     dependency_status.as_label()
+                    ,prepare.vulkan_status.as_label()
                 ))
             })()
             .map_err(|error| format!("{error:#}"));
@@ -1548,9 +1550,12 @@ impl App {
                         && self.setup_status.wineboot_available
                         && self.setup_status.wineserver_available
                         && self.setup_status.winetricks_available
+                        && self.setup_status.bash_available
+                        && self.setup_status.tar_available
                 }
                 SetupStep::BuildHelper => self.setup_status.cwassettool_binary,
                 SetupStep::GameFolder => self.game_root_path().is_some(),
+                SetupStep::VulkanRuntime => self.setup_status.vulkan_runtime_ready,
                 SetupStep::Ready => false,
             });
         self.widgets
@@ -1561,6 +1566,7 @@ impl App {
                 SetupStep::SystemDependencies => false,
                 SetupStep::BuildHelper => !self.setup_status.cwassettool_binary,
                 SetupStep::GameFolder => true,
+                SetupStep::VulkanRuntime => !self.setup_status.vulkan_runtime_ready,
                 SetupStep::Ready => {
                     self.setup_status.setup_ready() && self.game_root_path().is_some()
                 }
@@ -1620,6 +1626,10 @@ impl App {
             SetupStep::GameFolder => (
                 "Choose the GTA V game folder. The app will automatically use or create the mods folder inside it, while all temporary edit files stay in the app workspace.",
                 Some("Choose Game Folder"),
+            ),
+            SetupStep::VulkanRuntime => (
+                "Prepare the local Vulkan runtime bundle used to run the Linux-optimized GTA V build. The wizard will cache the required files in this app workspace.",
+                Some("Prepare Vulkan Runtime"),
             ),
             SetupStep::Ready => (
                 "Setup is complete. You can continue into the main application. You can run the wizard again later from the app menu.",
@@ -1702,6 +1712,16 @@ impl App {
                     self.setup_status.winetricks_available,
                     "Required to install the GTA runtime dependencies",
                 ));
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "bash",
+                    self.setup_status.bash_available,
+                    "Required to apply the Vulkan runtime scripts",
+                ));
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "tar",
+                    self.setup_status.tar_available,
+                    "Required to extract the cached Vulkan runtime bundle",
+                ));
             }
             SetupStep::BuildHelper => {
                 self.widgets.setup_list_box.append(&setup_status_row(
@@ -1730,6 +1750,19 @@ impl App {
                 self.widgets
                     .setup_list_box
                     .append(&setup_info_row("Derived mods folder", &mods_root));
+            }
+            SetupStep::VulkanRuntime => {
+                let cache_path =
+                    launcher::cached_vulkan_archive_path(&self.tool_paths.workspace_dir);
+                self.widgets.setup_list_box.append(&setup_status_row(
+                    "Cached Vulkan runtime",
+                    self.setup_status.vulkan_runtime_ready,
+                    &cache_path.display().to_string(),
+                ));
+                self.widgets.setup_list_box.append(&setup_info_row(
+                    "Expected source",
+                    "/home/takasu/Documents/codinglab/rusty-gta/vulkan.tar.xz",
+                ));
             }
             SetupStep::Ready => {
                 self.widgets.setup_list_box.append(&setup_status_row(
@@ -2468,12 +2501,24 @@ impl App {
                     Ok(()) => {
                         self.setup_status = SetupStatus::detect(&self.tool_paths);
                         if self.setup_step == SetupStep::BuildHelper {
-                            self.setup_step = SetupStep::Ready;
+                            self.setup_step = SetupStep::GameFolder;
                         }
                         self.set_status("Built the CwAssetTool helper successfully.");
                     }
                     Err(error) => {
                         self.set_status(format!("Helper build failed: {error}"));
+                    }
+                },
+                JobResult::PrepareVulkanRuntimeFinished(result) => match result {
+                    Ok(message) => {
+                        self.setup_status = SetupStatus::detect(&self.tool_paths);
+                        if self.setup_step == SetupStep::VulkanRuntime {
+                            self.setup_step = SetupStep::Ready;
+                        }
+                        self.set_status(message);
+                    }
+                    Err(error) => {
+                        self.set_status(format!("Vulkan runtime setup failed: {error}"));
                     }
                 },
                 JobResult::UpdateCodeWalkerFinished(result) => match result {
@@ -3864,6 +3909,11 @@ impl App {
                     });
                 });
             }
+            SetupStep::VulkanRuntime => {
+                if !self.setup_status.vulkan_runtime_ready {
+                    self.queue_prepare_vulkan_runtime();
+                }
+            }
             SetupStep::Ready => {
                 if !self.setup_status.setup_ready() || self.game_root_path().is_none() {
                     self.set_status("Setup is not complete yet.");
@@ -3877,6 +3927,20 @@ impl App {
             }
             SetupStep::SystemDependencies => {}
         }
+    }
+
+    fn queue_prepare_vulkan_runtime(&mut self) {
+        let tx = self.job_tx.clone();
+        let workspace_dir = self.tool_paths.workspace_dir.clone();
+        self.pending_jobs += 1;
+        self.set_status("Caching the Vulkan runtime bundle...");
+
+        thread::spawn(move || {
+            let result = launcher::cache_vulkan_runtime(&workspace_dir)
+                .map(|status| format!("Vulkan runtime {}.", status.as_label()))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(JobResult::PrepareVulkanRuntimeFinished(result));
+        });
     }
 
     fn queue_download_codewalker(&mut self) {
